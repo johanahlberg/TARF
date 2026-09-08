@@ -1,45 +1,132 @@
 import numpy as np
+from scipy.interpolate import CubicSpline
 from scipy.linalg import expm, solve_banded
 from scipy.stats import norm
 
 from .model import RegimeSwitchingLocalVolModel, SingleRegimeLocalVolModel
 from .product import TARFAccumulator
 
+# Rannacher startup: number of fully-implicit steps applied immediately after every non-smooth event
+# (the terminal condition and each fixing jump) before switching to Crank-Nicolson. This damps the
+# CN oscillation that a discontinuous payoff/knockout would otherwise excite near the kink.
+RANNACHER_STEPS = 2
 
-def _tarf_spot_operator(local_vol: float, rate: float, dividend_yield: float, s_grid: np.ndarray, dt: float) -> np.ndarray:
-    """Build one implicit-Euler tridiagonal spot-diffusion operator for a TARF value slice.
 
-    Boundaries use a Neumann (zero-gradient) condition rather than a payoff-specific Dirichlet guess:
-    the TARF payoff includes leveraged OTM losses and a KI barrier, so there is no single closed-form
-    value to pin the edges to, and zero-gradient is the standard robust choice for an arbitrary payoff.
+def _log_spot_grid(
+    spot: float,
+    strike: float,
+    sigma_ref: float,
+    maturity: float,
+    num_spot: int,
+    n_std: float = 5.0,
+) -> np.ndarray:
+    """Uniform grid in ``x = ln S`` (paper Section 4.4), with the spot pinned to a node and the strike
+    pinned as well whenever that does not blow up the node count.
+
+    A uniform log grid is what makes the central-difference stencil second-order consistent -- the
+    previous implementation used a uniform-grid stencil on a geometrically-spaced grid, which is only
+    first-order and biased the price by several percent with no convergence under refinement.
     """
-    n = len(s_grid)
-    lower = np.zeros(n - 1, dtype=float)
-    diag = np.ones(n, dtype=float)
-    upper = np.zeros(n - 1, dtype=float)
-    sigma_sq = local_vol * local_vol
-    drift = rate - dividend_yield
+    num_spot = max(41, int(num_spot))
+    if num_spot % 2 == 0:
+        num_spot += 1
 
-    for i in range(1, n - 1):
-        ds_left = s_grid[i] - s_grid[i - 1]
-        ds_right = s_grid[i + 1] - s_grid[i]
-        ds = 0.5 * (ds_left + ds_right)
-        alpha = 0.5 * sigma_sq * s_grid[i] * s_grid[i] / (ds * ds)
-        beta = drift * s_grid[i] / (2.0 * ds)
-        lower[i - 1] = -dt * (alpha - beta)
-        diag[i] = 1.0 + dt * (2.0 * alpha + rate)
-        upper[i] = -dt * (alpha + beta)
+    center = np.log(spot)
+    log_mny = np.log(strike / spot)
+    half_width = max(n_std * sigma_ref * np.sqrt(max(maturity, 1e-6)), abs(log_mny) * 1.5, 0.1)
+    dx = 2.0 * half_width / (num_spot - 1)
 
-    diag[0] = 1.0
-    upper[0] = -1.0
-    lower[-1] = -1.0
-    diag[-1] = 1.0
+    # Pin the strike too when it sits at least half a step away and doing so keeps the grid bounded.
+    steps_to_strike = int(round(log_mny / dx))
+    if abs(log_mny) >= 0.5 * dx and steps_to_strike != 0:
+        dx = log_mny / steps_to_strike  # same sign as log_mny, so dx > 0
+        half_pts = int(np.ceil(half_width / dx))
+        if 2 * half_pts + 1 <= 6 * num_spot:
+            return center + dx * np.arange(-half_pts, half_pts + 1)
 
-    banded = np.zeros((3, n), dtype=float)
-    banded[0, 1:] = upper
-    banded[1, :] = diag
-    banded[2, :-1] = lower
-    return banded
+    half_pts = (num_spot - 1) // 2
+    return center + dx * np.arange(-half_pts, half_pts + 1)
+
+
+class _LogVolOperator:
+    """Spatial operator L for the log-space pricing PDE (paper eq. 17)
+
+        dV/dt + 1/2 sigma(x)^2 V_xx + nu(x) V_x - r_d V = 0,   nu = r_d - r_f - 1/2 sigma^2
+
+    discretised with central differences on a uniform ``x`` grid. Interior rows are the standard
+    second-order stencil; the two boundary rows impose d^2V/dS^2 = 0 (paper Section 4.3) as a plain
+    linear-in-S extrapolation, which for a payoff at most linear in S at the far field is exact.
+    The linear-extrapolation rows reach three nodes deep, so the linear system is pentadiagonal.
+    L is time-independent here, so it is built once and reused across every theta-scheme step.
+    """
+
+    def __init__(self, x_grid: np.ndarray, sigma_nodes: np.ndarray, rate: float, dividend_yield: float) -> None:
+        n = len(x_grid)
+        dx = float(x_grid[1] - x_grid[0])
+        s_grid = np.exp(x_grid)
+        sigma = np.asarray(sigma_nodes, dtype=float)
+        nu = rate - dividend_yield - 0.5 * sigma * sigma
+
+        diff = 0.5 * sigma * sigma / (dx * dx)
+        adv = nu / (2.0 * dx)
+
+        # Interior stencil coefficients (rows 1 .. n-2); boundary rows are algebraic, handled in step().
+        self.n = n
+        self.rate = float(rate)
+        self.sub = diff - adv
+        self.diag = -2.0 * diff - rate
+        self.sup = diff + adv
+        # Linear-in-S extrapolation weights: V_0 = (1+r0) V_1 - r0 V_2, V_{n-1} = (1+rN) V_{n-2} - rN V_{n-3}.
+        self.r0 = float((s_grid[0] - s_grid[1]) / (s_grid[1] - s_grid[2]))
+        self.rN = float((s_grid[-1] - s_grid[-2]) / (s_grid[-2] - s_grid[-3]))
+
+    def matvec(self, values: np.ndarray) -> np.ndarray:
+        """Apply the interior part of L; boundary rows return 0 (they are algebraic constraints)."""
+        out = np.zeros_like(values)
+        if values.ndim == 2:
+            out[1:-1] = (
+                self.sub[1:-1, None] * values[:-2]
+                + self.diag[1:-1, None] * values[1:-1]
+                + self.sup[1:-1, None] * values[2:]
+            )
+        else:
+            out[1:-1] = self.sub[1:-1] * values[:-2] + self.diag[1:-1] * values[1:-1] + self.sup[1:-1] * values[2:]
+        return out
+
+    def step(self, values: np.ndarray, dt: float, theta: float) -> np.ndarray:
+        """One backward theta-scheme step: (I - theta dt L) V^n = (I + (1-theta) dt L) V^{n+1}."""
+        rhs = values + (1.0 - theta) * dt * self.matvec(values)
+        rhs[0] = 0.0
+        rhs[-1] = 0.0
+
+        ab = np.zeros((5, self.n))  # solve_banded (l=2, u=2) layout: ab[2 + i - j, j] = A[i, j]
+        ab[1, 2:] = -theta * dt * self.sup[1:-1]          # A[i, i+1], interior rows i = 1 .. n-2
+        ab[2, 1:-1] = 1.0 - theta * dt * self.diag[1:-1]  # A[i, i]
+        ab[3, :-2] = -theta * dt * self.sub[1:-1]         # A[i, i-1]
+
+        # Row 0: V_0 - (1 + r0) V_1 + r0 V_2 = 0
+        ab[2, 0] = 1.0
+        ab[1, 1] = -(1.0 + self.r0)
+        ab[0, 2] = self.r0
+        # Row n-1: V_{n-1} - (1 + rN) V_{n-2} + rN V_{n-3} = 0
+        ab[2, -1] = 1.0
+        ab[3, -2] = -(1.0 + self.rN)
+        ab[4, -3] = self.rN
+
+        return solve_banded((2, 2), ab, rhs)
+
+
+def _interp_along_accumulation(a_grid: np.ndarray, column_values: np.ndarray, query: np.ndarray) -> np.ndarray:
+    """Interpolate a value curve in the accumulated-amount coordinate.
+
+    The paper stresses that the jump-condition interpolation must be smooth: linear/quadratic schemes
+    can converge to the wrong answer for discretely-sampled path dependence (Forsyth et al. 2002).
+    A natural cubic spline is used, with a linear fallback for grids too small to spline.
+    """
+    clipped = np.clip(query, a_grid[0], a_grid[-1])
+    if len(a_grid) >= 4:
+        return CubicSpline(a_grid, column_values, bc_type="natural")(clipped)
+    return np.interp(clipped, a_grid, column_values)
 
 
 def _apply_tarf_fixing(
@@ -51,9 +138,14 @@ def _apply_tarf_fixing(
 ) -> np.ndarray:
     """Apply one fixing-date jump of the TARF payoff to a (spot, accumulated) value grid.
 
-    ``values`` is the continuation value evaluated immediately after this fixing, i.e. the backward
-    solve for the remaining future fixings. Returns the value immediately before the fixing,
-    incorporating this fixing's realized cashflow and (on the ITM side) the accumulation jump.
+    This is the paper's forward jump condition (eq. 10), explicit in the on-grid accumulated amount:
+
+        V(S, t_k^-, A_j) = V(S, t_k, A_j + C_k(S, A_j)) + C_k(S, A_j)
+
+    ``values`` is the continuation value immediately after this fixing; the return is the value
+    immediately before it. On the ITM side ``A`` advances by a spot-dependent increment (handled by the
+    spline interpolation above) and may breach the target, triggering the knockout settlement. On the
+    OTM side ``A`` is unchanged and the leveraged / barrier-gated cashflow is added directly.
     """
     intrinsic = (s_grid - tarf.strike) * tarf.call_or_put
     itm_mask = intrinsic > 0.0
@@ -86,30 +178,54 @@ def _apply_tarf_fixing(
                 settlement_intrinsic = np.where(terminated, (spot - adjusted_strike) * tarf.call_or_put, settlement_intrinsic)
             elif tarf.target_adjustment == 2:
                 settlement_notional = np.where(terminated, notional1 * (remaining / increment), settlement_notional)
+            elif tarf.target_adjustment == 3:
+                settlement_notional = np.where(terminated, 0.0, settlement_notional)
 
         cashflow = settlement_notional * settlement_intrinsic
-        continuation = np.interp(np.clip(accumulated_new, a_grid[0], a_grid[-1]), a_grid, values[i, :])
+        continuation = _interp_along_accumulation(a_grid, values[i, :], accumulated_new)
         result[i, :] = cashflow + np.where(terminated, 0.0, continuation)
 
     return result
 
 
 def _tarf_fixing_schedule(tarf: TARFAccumulator, maturity: float) -> list[tuple[int, float]]:
-    return [(k, float(d)) for k, d in enumerate(tarf.fixing_dates) if 0.0 < float(d) <= maturity]
+    return [(k, float(d)) for k, d in enumerate(tarf.fixing_dates) if 0.0 < float(d) <= maturity + 1e-12]
 
 
-def _tarf_time_grid(fixing_schedule: list[tuple[int, float]], maturity: float, n_steps: int) -> np.ndarray:
-    fixing_only_times = [d for _, d in fixing_schedule]
-    return np.unique(np.concatenate([np.linspace(0.0, maturity, n_steps + 1), fixing_only_times, [0.0, maturity]]))
+def _event_times(fixing_schedule: list[tuple[int, float]], maturity: float) -> np.ndarray:
+    return np.array(sorted({0.0, float(maturity), *(d for _, d in fixing_schedule)}))
+
+
+def _segment_steps(segment_length: float, maturity: float, n_steps: int) -> int:
+    return max(RANNACHER_STEPS + 1, int(round(n_steps * segment_length / maturity)))
+
+
+def _march_segment(operators, values: np.ndarray, t_hi: float, t_lo: float, n_sub: int, couple=None) -> np.ndarray:
+    """March one inter-event segment backward from ``t_hi`` to ``t_lo`` with Rannacher startup.
+
+    ``operators`` is a single ``_LogVolOperator`` (single regime) or a list of three (coupled). When
+    coupled, ``couple(dt)`` returns exp(Q dt) and the regimes are recombined after each diffusion
+    sub-step -- operator splitting, with the Q-coupling done exactly via the matrix exponential.
+    """
+    step_times = np.linspace(t_hi, t_lo, n_sub + 1)
+    for s in range(n_sub):
+        dt = float(step_times[s] - step_times[s + 1])
+        theta = 1.0 if s < RANNACHER_STEPS else 0.5
+        if couple is None:
+            values = operators.step(values, dt, theta)
+        else:
+            diffused = np.stack([op.step(values[r], dt, theta) for r, op in enumerate(operators)])
+            values = np.einsum("ij,jkl->ikl", couple(dt), diffused)
+    return values
 
 
 class SingleRegimePricer:
-    """Single-regime local-vol pricer with a finite-difference TARF valuation step.
+    """Single-regime local-vol pricer with a finite-difference TARF valuation, following the scheme of
+    Luo & Shevchenko, *Pricing TARN Using a Finite Difference Method* (arXiv:1304.7563).
 
-    The implementation follows the architecture in the task brief: a spot-grid PDE is solved backward
-    over time, while the TARF accumulation logic is applied at fixing dates to mimic the target-level
-    trigger and the payoff kink. The solver uses a compact stencil and a short Rannacher-style startup
-    to damp oscillatory CN-like behaviour without introducing a large code footprint.
+    Tracks ``num_target`` one-dimensional log-space PDE solutions (one per accumulated-amount node),
+    couples them only through the fixing-date jump condition, uses a Crank-Nicolson theta-scheme with
+    Rannacher startup, and interpolates the jump with a natural cubic spline.
     """
 
     def __init__(
@@ -121,17 +237,11 @@ class SingleRegimePricer:
     ) -> None:
         self.model = model
         self.num_spot = max(41, int(num_spot))
-        self.num_target = max(10, int(num_target))
+        self.num_target = max(4, int(num_target))
         self.n_steps = max(20, int(n_steps))
 
-    def _spot_grid(self, lower_frac: float = 0.2, upper_frac: float = 3.0) -> np.ndarray:
-        s_min = max(self.model.spot * lower_frac, 1e-6)
-        s_max = self.model.spot * upper_frac
-        grid = np.geomspace(s_min, s_max, self.num_spot)
-        return grid
-
     def price_european(self, strike: float, maturity: float, option_type: str = "call") -> float:
-        """Closed-form European price in the constant-vol local-vol limit."""
+        """Closed-form European price in the flat-vol limit (``model.local_vol`` as the ATM level)."""
         if maturity <= 0.0:
             raise ValueError("maturity must be positive")
         if strike <= 0.0:
@@ -154,55 +264,100 @@ class SingleRegimePricer:
             price = strike * np.exp(-r * maturity) * norm.cdf(-d2) - s * np.exp(-q * maturity) * norm.cdf(-d1)
         return float(price)
 
-    def solve_tarf_pde(self, tarf: TARFAccumulator, maturity: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """2D finite-difference TARF solve on a (spot, accumulated) grid.
+    def _grids(self, tarf: TARFAccumulator, maturity: float) -> tuple[np.ndarray, np.ndarray]:
+        s_grid = np.exp(
+            _log_spot_grid(self.model.spot, tarf.strike, self.model.sigma_ref, maturity, self.num_spot)
+        )
+        a_lo = min(0.0, tarf.accumulated_value)
+        a_grid = np.linspace(a_lo, tarf.target_level, self.num_target)
+        return s_grid, a_grid
 
-        Between fixing dates the accumulated-so-far state ``A`` is constant and each A-slice diffuses
-        independently via implicit spot diffusion (discounting is embedded in the tridiagonal system, so
-        no separate terminal discount factor is applied). At each fixing date, ``_apply_tarf_fixing``
-        applies the udmcTRFPayoff jump: an ITM fixing advances ``A`` by a spot-dependent increment
-        (requiring interpolation along the A grid) and pays the accumulation cashflow, or terminates the
-        deal; an OTM fixing leaves ``A`` unchanged and pays the leveraged/barrier-gated cashflow.
+    def solve_tarf_pde(self, tarf: TARFAccumulator, maturity: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Backward finite-difference TARF solve on a (spot, accumulated) grid.
+
+        Zero terminal condition at ``T``; the final fixing's jump is applied first (T -> T^-), then the
+        theta-scheme marches each accumulated-amount slice back to ``t_0``, re-applying the jump at
+        every fixing date. Discounting is embedded in L, so the price is read straight off the grid.
         """
         if maturity <= 0:
             raise ValueError("maturity must be positive")
 
-        s_grid = self._spot_grid(lower_frac=0.15, upper_frac=2.8)
-        a_lo = min(0.0, tarf.accumulated_value)
-        a_grid = np.linspace(a_lo, tarf.target_level, self.num_target)
+        s_grid, a_grid = self._grids(tarf, maturity)
+        x_grid = np.log(s_grid)
+        sigma_nodes = self.model.local_volatility(s_grid)
+        operator = _LogVolOperator(x_grid, sigma_nodes, self.model.rate, self.model.dividend_yield)
+
+        schedule = _tarf_fixing_schedule(tarf, maturity)
+        fixing_at = {round(d, 12): k for k, d in schedule}
+        events = _event_times(schedule, maturity)
 
         values = np.zeros((len(s_grid), len(a_grid)), dtype=float)
 
-        fixing_schedule = _tarf_fixing_schedule(tarf, maturity)
-        n_steps = max(30, self.n_steps)
-        times = _tarf_time_grid(fixing_schedule, maturity, n_steps)
+        applied: set[int] = set()
+        top_key = round(float(events[-1]), 12)
+        if top_key in fixing_at:
+            values = _apply_tarf_fixing(tarf, fixing_at[top_key], s_grid, a_grid, values)
+            applied.add(fixing_at[top_key])
 
-        for idx in range(len(times) - 2, -1, -1):
-            current_time = times[idx]
-            dt = times[idx + 1] - times[idx]
-            banded = _tarf_spot_operator(self.model.local_vol, self.model.rate, self.model.dividend_yield, s_grid, dt)
+        for seg in range(len(events) - 2, -1, -1):
+            t_hi, t_lo = float(events[seg + 1]), float(events[seg])
+            n_sub = _segment_steps(t_hi - t_lo, maturity, self.n_steps)
+            values = _march_segment(operator, values, t_hi, t_lo, n_sub)
 
-            new_values = np.empty_like(values)
-            for j in range(len(a_grid)):
-                rhs = values[:, j].copy()
-                rhs[0] = 0.0
-                rhs[-1] = 0.0
-                new_values[:, j] = solve_banded((1, 1), banded, rhs)
-            values = new_values
-
-            match = next((k for k, d in fixing_schedule if np.isclose(current_time, d, atol=1e-8, rtol=1e-8)), None)
-            if match is not None:
-                values = _apply_tarf_fixing(tarf, match, s_grid, a_grid, values)
+            key = round(t_lo, 12)
+            if key in fixing_at and fixing_at[key] not in applied:
+                values = _apply_tarf_fixing(tarf, fixing_at[key], s_grid, a_grid, values)
+                applied.add(fixing_at[key])
 
         return s_grid, a_grid, values
 
     def price_tarf(self, tarf: TARFAccumulator, maturity: float) -> float:
         s_grid, a_grid, values = self.solve_tarf_pde(tarf=tarf, maturity=maturity)
         idx_spot = int(np.argmin(np.abs(s_grid - self.model.spot)))
-        return float(np.interp(tarf.accumulated_value, a_grid, values[idx_spot, :]))
+        return float(_interp_along_accumulation(a_grid, values[idx_spot, :], np.array([tarf.accumulated_value]))[0])
+
+    def tarf_greeks(self, tarf: TARFAccumulator, maturity: float, vega_bump: float = 1e-4) -> dict[str, float]:
+        """Delta/gamma read directly off the PDE grid (no bump-and-revalue); vega by a single vol bump.
+
+        On the uniform ``x = ln S`` grid, with V_x and V_xx by central differences at the pinned spot
+        node: delta = V_x / S, gamma = (V_xx - V_x) / S^2.
+        """
+        s_grid, a_grid, values = self.solve_tarf_pde(tarf=tarf, maturity=maturity)
+        idx = int(np.argmin(np.abs(s_grid - self.model.spot)))
+        idx = min(max(idx, 1), len(s_grid) - 2)
+        s0 = float(s_grid[idx])
+        dx = float(np.log(s_grid[1]) - np.log(s_grid[0]))
+
+        curve = np.array(
+            [
+                _interp_along_accumulation(a_grid, values[j, :], np.array([tarf.accumulated_value]))[0]
+                for j in (idx - 1, idx, idx + 1)
+            ]
+        )
+        price = float(curve[1])
+        v_x = (curve[2] - curve[0]) / (2.0 * dx)
+        v_xx = (curve[2] - 2.0 * curve[1] + curve[0]) / (dx * dx)
+        delta = v_x / s0
+        gamma = (v_xx - v_x) / (s0 * s0)
+
+        bumped = SingleRegimeLocalVolModel(
+            spot=self.model.spot,
+            rate=self.model.rate,
+            dividend_yield=self.model.dividend_yield,
+            local_vol=self.model.local_vol + vega_bump,
+            strike=self.model.strike,
+            skew=self.model.skew,
+            curvature=self.model.curvature,
+            smile_ref=self.model.smile_ref,
+            vol_floor=self.model.vol_floor,
+        )
+        price_up = SingleRegimePricer(bumped, self.num_spot, self.num_target, self.n_steps).price_tarf(tarf, maturity)
+        vega = (price_up - price) / vega_bump * 0.01
+
+        return {"price": price, "delta": float(delta), "gamma": float(gamma), "vega": float(vega)}
 
     def compute_greeks(self, strike: float, maturity: float) -> dict[str, float]:
-        """Minimal delta/gamma/vega scaffolding that matches the brief's on-grid Greeks design."""
+        """European delta/gamma/vega scaffold retained for the calibration/interface tests."""
         base_price = self.price_european(strike=strike, maturity=maturity)
         hp = 1e-3
 
@@ -220,28 +375,30 @@ class SingleRegimePricer:
 
 
 class ThreeRegimePricer:
-    """Weighted three-regime extension for the regime-switching architecture.
+    """Three coupled regime layers sharing one (spot, accumulated) grid.
 
-    This is the clean next layer beyond the validated single-regime baseline. It preserves the exact
-    generator matrix structure and offers a weighted mixture price, which is consistent with the brief's
-    recommended separation between smile calibration and switching-matrix calibration.
+    Between fixings each regime diffuses independently via its own ``_LogVolOperator`` and the three
+    are recombined by exp(Q dt) after every sub-step (operator splitting). At each fixing the jump
+    condition is applied per regime. In the single-regime limit (identical regimes) exp(Q dt) acts as
+    the identity on the common value, so this reduces exactly to ``SingleRegimePricer``.
     """
 
     def __init__(
         self,
         model: RegimeSwitchingLocalVolModel,
         regime_weights: np.ndarray | None = None,
-        num_spot: int = 81,
-        num_target: int = 50,
-        n_steps: int = 60,
+        num_spot: int = 121,
+        num_target: int = 80,
+        n_steps: int = 80,
     ):
         self.model = model
         self.num_spot = max(41, int(num_spot))
-        self.num_target = max(10, int(num_target))
+        self.num_target = max(4, int(num_target))
         self.n_steps = max(20, int(n_steps))
         if regime_weights is None:
             regime_weights = np.ones(3, dtype=float) / 3.0
-        if np.shape(regime_weights) != (3,):
+        regime_weights = np.asarray(regime_weights, dtype=float)
+        if regime_weights.shape != (3,):
             raise ValueError("regime_weights must be a 1D array of length 3")
         if not np.all(regime_weights >= 0.0):
             raise ValueError("regime weights must be non-negative")
@@ -250,82 +407,69 @@ class ThreeRegimePricer:
         self.regime_weights = regime_weights
 
     def solve_tarf_coupled_pde(self, tarf: TARFAccumulator, maturity: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Solve three coupled TARF PDE layers on a common (spot, accumulated) grid.
-
-        Between fixing dates, each regime's slice diffuses independently (implicit spot diffusion via
-        ``_tarf_spot_operator``) and the three regimes are then coupled by an exact short-step Q
-        propagation (``expm(Q * dt)``), which preserves positivity of the generator's probability
-        structure. At each fixing date, ``_apply_tarf_fixing`` is applied per regime to jump the
-        accumulated state and realize that fixing's cashflow, exactly as in the single-regime solve.
-        """
         if maturity <= 0.0:
             raise ValueError("maturity must be positive")
 
-        reference = self.model.regimes[0]
-        s_grid = SingleRegimePricer(reference, num_spot=self.num_spot, num_target=self.num_target)._spot_grid(
-            lower_frac=0.15, upper_frac=2.8
-        )
-        a_lo = min(0.0, tarf.accumulated_value)
-        a_grid = np.linspace(a_lo, tarf.target_level, self.num_target)
-        values = np.zeros((3, len(s_grid), len(a_grid)), dtype=float)
+        reference = SingleRegimePricer(self.model.regimes[0], self.num_spot, self.num_target, self.n_steps)
+        s_grid, a_grid = reference._grids(tarf, maturity)
+        x_grid = np.log(s_grid)
 
-        fixing_schedule = _tarf_fixing_schedule(tarf, maturity)
-        n_steps = max(30, self.n_steps)
-        times = _tarf_time_grid(fixing_schedule, maturity, n_steps)
-        q = self.model.q if self.model.q is not None else np.zeros((3, 3), dtype=float)
+        operators = [
+            _LogVolOperator(x_grid, regime.local_volatility(s_grid), regime.rate, regime.dividend_yield)
+            for regime in self.model.regimes
+        ]
+        q = np.asarray(self.model.q if self.model.q is not None else np.zeros((3, 3)), dtype=float)
         if q.shape != (3, 3):
             raise ValueError("Generator matrix must be 3x3")
+        couple = lambda dt: expm(q * dt)  # noqa: E731
 
-        for step_index in range(len(times) - 2, -1, -1):
-            current_time = times[step_index]
-            dt = times[step_index + 1] - times[step_index]
+        schedule = _tarf_fixing_schedule(tarf, maturity)
+        fixing_at = {round(d, 12): k for k, d in schedule}
+        events = _event_times(schedule, maturity)
 
-            diffused = np.empty_like(values)
-            for regime_index, regime in enumerate(self.model.regimes):
-                banded = _tarf_spot_operator(regime.local_vol, regime.rate, regime.dividend_yield, s_grid, dt)
-                for j in range(len(a_grid)):
-                    rhs = values[regime_index, :, j].copy()
-                    rhs[0] = 0.0
-                    rhs[-1] = 0.0
-                    diffused[regime_index, :, j] = solve_banded((1, 1), banded, rhs)
+        values = np.zeros((3, len(s_grid), len(a_grid)), dtype=float)
 
-            values = np.einsum("ij,jkl->ikl", expm(q * dt), diffused)
+        applied: set[int] = set()
+        top_key = round(float(events[-1]), 12)
+        if top_key in fixing_at:
+            for r in range(3):
+                values[r] = _apply_tarf_fixing(tarf, fixing_at[top_key], s_grid, a_grid, values[r])
+            applied.add(fixing_at[top_key])
 
-            match = next((k for k, d in fixing_schedule if np.isclose(current_time, d, atol=1e-8, rtol=1e-8)), None)
-            if match is not None:
-                for regime_index in range(3):
-                    values[regime_index] = _apply_tarf_fixing(tarf, match, s_grid, a_grid, values[regime_index])
+        for seg in range(len(events) - 2, -1, -1):
+            t_hi, t_lo = float(events[seg + 1]), float(events[seg])
+            n_sub = _segment_steps(t_hi - t_lo, maturity, self.n_steps)
+            values = _march_segment(operators, values, t_hi, t_lo, n_sub, couple=couple)
+
+            key = round(t_lo, 12)
+            if key in fixing_at and fixing_at[key] not in applied:
+                for r in range(3):
+                    values[r] = _apply_tarf_fixing(tarf, fixing_at[key], s_grid, a_grid, values[r])
+                applied.add(fixing_at[key])
 
         return s_grid, a_grid, values
 
     def _single_regime_value(self, strike: float, maturity: float, option_type: str = "call") -> np.ndarray:
-        prices = []
-        for regime in self.model.regimes:
-            sub_model = SingleRegimePricer(model=regime)
-            prices.append(sub_model.price_european(strike=strike, maturity=maturity, option_type=option_type))
-        return np.asarray(prices, dtype=float)
+        return np.asarray(
+            [
+                SingleRegimePricer(model=regime).price_european(strike=strike, maturity=maturity, option_type=option_type)
+                for regime in self.model.regimes
+            ],
+            dtype=float,
+        )
 
     def _apply_regime_transition(self, regime_values: np.ndarray, maturity: float, n_steps: int | None = None) -> np.ndarray:
-        """Advance the regime vector through the generator matrix using a small time-sliced exponential.
-
-        This keeps the implementation faithful to the brief's operator-splitting idea: the Q-coupling is
-        applied over multiple short substeps rather than in one large maturity jump, which makes the
-        transition step more stable in practice and better reflects the intended PDE treatment.
-        """
         values = np.asarray(regime_values, dtype=float)
         if values.shape != (3,):
             raise ValueError("regime_values must be a length-3 vector")
 
         q = self.model.q if self.model.q is not None else np.zeros((3, 3), dtype=float)
-        if q.shape != (3, 3):
-            raise ValueError("Generator matrix must be 3x3")
         if np.allclose(q, 0.0):
             return values.copy()
 
         if n_steps is None:
             n_steps = max(8, min(80, int(max(maturity, 0.0) * 40) + 1))
         dt = maturity / max(n_steps, 1)
-
         propagated = values.copy()
         for _ in range(max(n_steps, 1)):
             propagated = expm(q * dt) @ propagated
@@ -336,20 +480,71 @@ class ThreeRegimePricer:
         coupled = self._apply_regime_transition(values, maturity=maturity)
         return float(np.dot(self.regime_weights, coupled))
 
-    def price_tarf(self, tarf: TARFAccumulator, maturity: float) -> float:
+    def _regime_curve(self, tarf: TARFAccumulator, maturity: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         s_grid, a_grid, values = self.solve_tarf_coupled_pde(tarf=tarf, maturity=maturity)
         idx_spot = int(np.argmin(np.abs(s_grid - self.model.spot)))
         regime_values = np.array(
-            [np.interp(tarf.accumulated_value, a_grid, values[regime_index, idx_spot, :]) for regime_index in range(3)],
-            dtype=float,
+            [
+                _interp_along_accumulation(a_grid, values[r, idx_spot, :], np.array([tarf.accumulated_value]))[0]
+                for r in range(3)
+            ]
         )
+        return s_grid, a_grid, regime_values
+
+    def price_tarf(self, tarf: TARFAccumulator, maturity: float) -> float:
+        _, _, regime_values = self._regime_curve(tarf, maturity)
         return float(np.dot(self.regime_weights, regime_values))
 
     def price_tarf_coupled(self, tarf: TARFAccumulator, maturity: float) -> float:
-        """Generator-matrix-coupled TARF price.
-
-        This follows the brief's intended regime-switching design more closely than a flat weighted
-        average: the transition matrix Q is applied through the matrix exponential, which is the stable
-        way to advance the regime state over a time step.
-        """
+        """Generator-matrix-coupled TARF price (kept as an explicit name for the interface)."""
         return self.price_tarf(tarf=tarf, maturity=maturity)
+
+    def tarf_greeks(self, tarf: TARFAccumulator, maturity: float, vega_bump: float = 1e-4) -> dict[str, float]:
+        """Aggregate delta/gamma from the regime-weighted grid, plus per-regime and aggregate vega."""
+        s_grid, a_grid, values = self.solve_tarf_coupled_pde(tarf=tarf, maturity=maturity)
+        blended = np.einsum("r,rij->ij", self.regime_weights, values)
+
+        idx = int(np.argmin(np.abs(s_grid - self.model.spot)))
+        idx = min(max(idx, 1), len(s_grid) - 2)
+        s0 = float(s_grid[idx])
+        dx = float(np.log(s_grid[1]) - np.log(s_grid[0]))
+        curve = np.array(
+            [_interp_along_accumulation(a_grid, blended[j, :], np.array([tarf.accumulated_value]))[0] for j in (idx - 1, idx, idx + 1)]
+        )
+        price = float(curve[1])
+        v_x = (curve[2] - curve[0]) / (2.0 * dx)
+        v_xx = (curve[2] - 2.0 * curve[1] + curve[0]) / (dx * dx)
+
+        regime_vega: list[float] = []
+        for r, regime in enumerate(self.model.regimes):
+            bumped_regimes = list(self.model.regimes)
+            bumped_regimes[r] = SingleRegimeLocalVolModel(
+                spot=regime.spot,
+                rate=regime.rate,
+                dividend_yield=regime.dividend_yield,
+                local_vol=regime.local_vol + vega_bump,
+                strike=regime.strike,
+                skew=regime.skew,
+                curvature=regime.curvature,
+                smile_ref=regime.smile_ref,
+                vol_floor=regime.vol_floor,
+            )
+            bumped_model = RegimeSwitchingLocalVolModel(
+                spot=self.model.spot,
+                rate=self.model.rate,
+                dividend_yield=self.model.dividend_yield,
+                regimes=bumped_regimes,
+                q=self.model.q,
+            )
+            bumped_price = ThreeRegimePricer(
+                bumped_model, self.regime_weights, self.num_spot, self.num_target, self.n_steps
+            ).price_tarf(tarf, maturity)
+            regime_vega.append((bumped_price - price) / vega_bump * 0.01)
+
+        return {
+            "price": price,
+            "delta": float(v_x / s0),
+            "gamma": float((v_xx - v_x) / (s0 * s0)),
+            "vega": float(sum(regime_vega)),
+            "regime_vega": [float(v) for v in regime_vega],
+        }

@@ -1,4 +1,13 @@
-from .calibration import calibrate_regime_smile, fit_switching_matrix
+from .calibration import (
+    build_generator,
+    calibrate_regime_smile,
+    calibrate_regime_smiles,
+    calibrate_switching_rate,
+    fit_switching_matrix,
+    model_forward_variance,
+    model_total_variance,
+    regime_probabilities,
+)
 from .front_arena import (
     DEFAULT_REGIME_DELTAS,
     FallbackDenominatedValue,
@@ -21,7 +30,13 @@ __all__ = [
     "ThreeRegimePricer",
     "build_default_regime_matrix",
     "calibrate_regime_smile",
+    "calibrate_regime_smiles",
+    "calibrate_switching_rate",
     "fit_switching_matrix",
+    "build_generator",
+    "model_total_variance",
+    "model_forward_variance",
+    "regime_probabilities",
     "compute_local_greeks",
     "FallbackDenominatedValue",
     "price_tarf",
