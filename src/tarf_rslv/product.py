@@ -21,7 +21,9 @@ class TARFAccumulator:
 
     On an ITM fixing the realized intrinsic value (or its inverted-quote equivalent) accrues toward
     ``target_level``; once the target is reached the deal terminates, with the final cashflow shaped by
-    ``target_adjustment``. On an OTM fixing the leveraged ``notional2`` side pays out, unless a KI
+    ``target_adjustment`` (0 full gain, 1 strike-adjusted, 2 notional-adjusted / part gain,
+    3 no gain -- matching the three knockout types of Luo & Shevchenko plus the ESL variants).
+    On an OTM fixing the leveraged ``notional2`` side pays out, unless a KI
     ``barrier`` is enabled and this fixing's spot lands beyond it. The barrier check has no memory
     across fixings: each OTM fixing re-evaluates it fresh from the current spot alone.
     """
@@ -43,8 +45,11 @@ class TARFAccumulator:
             raise ValueError("target_level must be positive")
         if self.strike <= 0:
             raise ValueError("strike must be positive")
-        if self.target_adjustment not in (0, 1, 2):
-            raise ValueError("target_adjustment must be 0 (none), 1 (strike-adjusted) or 2 (notional-adjusted)")
+        if self.target_adjustment not in (0, 1, 2, 3):
+            raise ValueError(
+                "target_adjustment must be 0 (none / full gain), 1 (strike-adjusted), "
+                "2 (notional-adjusted / part gain) or 3 (no gain)"
+            )
         if len(self.fixing_dates) == 0:
             raise ValueError("fixing_dates must not be empty")
         if list(self.fixing_dates) != sorted(self.fixing_dates):
@@ -109,6 +114,8 @@ class TARFAccumulator:
                     settlement_intrinsic = (spot - adjusted_strike) * self.call_or_put
                 elif self.target_adjustment == 2:
                     settlement_notional = notional1 * (remaining / increment)
+                elif self.target_adjustment == 3:
+                    settlement_notional = 0.0
 
             return FixingOutcome(
                 cashflow=settlement_notional * settlement_intrinsic,
