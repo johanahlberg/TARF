@@ -18,10 +18,9 @@ def test_three_regime_price_is_finite_and_weighted():
     pricer = ThreeRegimePricer(model=model, regime_weights=np.array([0.2, 0.5, 0.3]))
 
     tarf = TARFAccumulator(
-        target_level=100.0,
-        coupon=0.05,
+        target_level=20.0,
+        strike=100.0,
         fixing_dates=[0.5, 1.0],
-        trigger_mode="accumulation",
     )
 
     price = pricer.price_tarf(tarf=tarf, maturity=1.0)
@@ -49,10 +48,9 @@ def test_three_regime_coupled_tarf_price_is_finite():
     )
     pricer = ThreeRegimePricer(model=model, regime_weights=np.array([0.2, 0.5, 0.3]))
     tarf = TARFAccumulator(
-        target_level=100.0,
-        coupon=0.05,
+        target_level=20.0,
+        strike=100.0,
         fixing_dates=[0.5, 1.0],
-        trigger_mode="accumulation",
     )
 
     price = pricer.price_tarf_coupled(tarf=tarf, maturity=1.0)
@@ -89,10 +87,9 @@ def test_three_regime_coupled_tarf_matches_single_regime_when_regimes_are_identi
     )
 
     tarf = TARFAccumulator(
-        target_level=100.0,
-        coupon=0.05,
+        target_level=20.0,
+        strike=100.0,
         fixing_dates=[0.5, 1.0],
-        trigger_mode="accumulation",
     )
 
     expected = SingleRegimePricer(model=model.regimes[0]).price_tarf(tarf=tarf, maturity=1.0)

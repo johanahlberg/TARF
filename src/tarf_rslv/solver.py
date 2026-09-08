@@ -6,6 +6,103 @@ from .model import RegimeSwitchingLocalVolModel, SingleRegimeLocalVolModel
 from .product import TARFAccumulator
 
 
+def _tarf_spot_operator(local_vol: float, rate: float, dividend_yield: float, s_grid: np.ndarray, dt: float) -> np.ndarray:
+    """Build one implicit-Euler tridiagonal spot-diffusion operator for a TARF value slice.
+
+    Boundaries use a Neumann (zero-gradient) condition rather than a payoff-specific Dirichlet guess:
+    the TARF payoff includes leveraged OTM losses and a KI barrier, so there is no single closed-form
+    value to pin the edges to, and zero-gradient is the standard robust choice for an arbitrary payoff.
+    """
+    n = len(s_grid)
+    lower = np.zeros(n - 1, dtype=float)
+    diag = np.ones(n, dtype=float)
+    upper = np.zeros(n - 1, dtype=float)
+    sigma_sq = local_vol * local_vol
+    drift = rate - dividend_yield
+
+    for i in range(1, n - 1):
+        ds_left = s_grid[i] - s_grid[i - 1]
+        ds_right = s_grid[i + 1] - s_grid[i]
+        ds = 0.5 * (ds_left + ds_right)
+        alpha = 0.5 * sigma_sq * s_grid[i] * s_grid[i] / (ds * ds)
+        beta = drift * s_grid[i] / (2.0 * ds)
+        lower[i - 1] = -dt * (alpha - beta)
+        diag[i] = 1.0 + dt * (2.0 * alpha + rate)
+        upper[i] = -dt * (alpha + beta)
+
+    diag[0] = 1.0
+    upper[0] = -1.0
+    lower[-1] = -1.0
+    diag[-1] = 1.0
+
+    banded = np.zeros((3, n), dtype=float)
+    banded[0, 1:] = upper
+    banded[1, :] = diag
+    banded[2, :-1] = lower
+    return banded
+
+
+def _apply_tarf_fixing(
+    tarf: TARFAccumulator,
+    fixing_index: int,
+    s_grid: np.ndarray,
+    a_grid: np.ndarray,
+    values: np.ndarray,
+) -> np.ndarray:
+    """Apply one fixing-date jump of the TARF payoff to a (spot, accumulated) value grid.
+
+    ``values`` is the continuation value evaluated immediately after this fixing, i.e. the backward
+    solve for the remaining future fixings. Returns the value immediately before the fixing,
+    incorporating this fixing's realized cashflow and (on the ITM side) the accumulation jump.
+    """
+    intrinsic = (s_grid - tarf.strike) * tarf.call_or_put
+    itm_mask = intrinsic > 0.0
+    notional1 = float(tarf.notional1[fixing_index])
+    notional2 = float(tarf.notional2[fixing_index])
+
+    result = np.empty_like(values)
+
+    otm_spot = s_grid[~itm_mask]
+    if otm_spot.size:
+        hit = np.array([tarf.barrier_is_hit(float(s)) for s in otm_spot])
+        otm_cashflow = notional2 * intrinsic[~itm_mask] * hit
+        result[~itm_mask, :] = otm_cashflow[:, None] + values[~itm_mask, :]
+
+    for i in np.nonzero(itm_mask)[0]:
+        spot = float(s_grid[i])
+        increment = tarf.accumulation_increment(spot)
+        accumulated_new = a_grid + increment
+        terminated = (tarf.target_level - accumulated_new) < tarf.zero_comparison
+
+        settlement_notional = np.full(a_grid.shape, notional1)
+        settlement_intrinsic = np.full(a_grid.shape, intrinsic[i])
+        if np.any(terminated):
+            remaining = tarf.target_level - a_grid
+            if tarf.target_adjustment == 1:
+                if tarf.inverted_target:
+                    adjusted_strike = 1.0 / ((1.0 / spot) - remaining * tarf.call_or_put * -1.0)
+                else:
+                    adjusted_strike = spot - remaining * tarf.call_or_put
+                settlement_intrinsic = np.where(terminated, (spot - adjusted_strike) * tarf.call_or_put, settlement_intrinsic)
+            elif tarf.target_adjustment == 2:
+                settlement_notional = np.where(terminated, notional1 * (remaining / increment), settlement_notional)
+
+        cashflow = settlement_notional * settlement_intrinsic
+        continuation = np.interp(np.clip(accumulated_new, a_grid[0], a_grid[-1]), a_grid, values[i, :])
+        result[i, :] = cashflow + np.where(terminated, 0.0, continuation)
+
+    return result
+
+
+def _tarf_fixing_schedule(tarf: TARFAccumulator, maturity: float) -> list[tuple[int, float]]:
+    return [(k, float(d)) for k, d in enumerate(tarf.fixing_dates) if 0.0 < float(d) <= maturity]
+
+
+def _tarf_time_grid(fixing_schedule: list[tuple[int, float]], maturity: float, n_steps: int) -> np.ndarray:
+    fixing_only_times = [d for _, d in fixing_schedule]
+    return np.unique(np.concatenate([np.linspace(0.0, maturity, n_steps + 1), fixing_only_times, [0.0, maturity]]))
+
+
 class SingleRegimePricer:
     """Single-regime local-vol pricer with a finite-difference TARF valuation step.
 
@@ -33,53 +130,6 @@ class SingleRegimePricer:
         grid = np.geomspace(s_min, s_max, self.num_spot)
         return grid
 
-    def _accumulation_grid(self) -> np.ndarray:
-        return np.linspace(0.0, max(self.model.spot, self.model.strike) * 2.0, self.num_target)
-
-    def _boundary_values(self, s_grid: np.ndarray, tarf: TARFAccumulator) -> np.ndarray:
-        return np.maximum(s_grid - tarf.target_level, 0.0)
-
-    def _apply_tarf_fixing(self, values: np.ndarray, s_grid: np.ndarray, tarf: TARFAccumulator) -> np.ndarray:
-        payoff = np.maximum(s_grid - tarf.target_level, 0.0)
-        return np.maximum(values, payoff)
-
-    def _advance_one_step(self, values: np.ndarray, s_grid: np.ndarray, dt: float) -> np.ndarray:
-        """Single implicit-Euler step in the spot direction, structured for later extension into a 2D PDE."""
-        n = len(s_grid)
-        sigma_sq = self.model.local_vol * self.model.local_vol
-        drift = self.model.rate - self.model.dividend_yield
-
-        lower = np.zeros(n - 1, dtype=float)
-        diag = np.ones(n, dtype=float)
-        upper = np.zeros(n - 1, dtype=float)
-        rhs = values.copy()
-
-        for i in range(1, n - 1):
-            s = s_grid[i]
-            ds_left = s_grid[i] - s_grid[i - 1]
-            ds_right = s_grid[i + 1] - s_grid[i]
-            ds = 0.5 * (ds_left + ds_right)
-            alpha = 0.5 * sigma_sq * (s * s) / (ds * ds)
-            beta = drift * s / (2.0 * ds)
-
-            lower[i - 1] = -dt * (alpha - beta)
-            diag[i] = 1.0 + dt * (2.0 * alpha + self.model.rate)
-            upper[i] = -dt * (alpha + beta)
-
-        rhs[0] = 0.0
-        rhs[-1] = max(s_grid[-1] - self.model.strike, 0.0)
-        diag[0] = 1.0
-        diag[-1] = 1.0
-        lower[0] = 0.0
-        upper[-1] = 0.0
-
-        banded = np.zeros((3, n), dtype=float)
-        banded[0, 1:] = upper
-        banded[1, :] = diag
-        banded[2, :-1] = lower
-
-        return solve_banded((1, 1), banded, rhs)
-
     def price_european(self, strike: float, maturity: float, option_type: str = "call") -> float:
         """Closed-form European price in the constant-vol local-vol limit."""
         if maturity <= 0.0:
@@ -105,91 +155,51 @@ class SingleRegimePricer:
         return float(price)
 
     def solve_tarf_pde(self, tarf: TARFAccumulator, maturity: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """A compact but materially more faithful 2D finite-difference TARF solve.
+        """2D finite-difference TARF solve on a (spot, accumulated) grid.
 
-        This implementation advances the solution on a spot/accumulation grid with:
-        - implicit spot diffusion per A-slice,
-        - accumulation drift in the A direction implemented as an advection step,
-        - Rannacher-style startup to smooth the target-trigger kink,
-        - fixing-date jump conditions that cap the value with the knockout trigger.
+        Between fixing dates the accumulated-so-far state ``A`` is constant and each A-slice diffuses
+        independently via implicit spot diffusion (discounting is embedded in the tridiagonal system, so
+        no separate terminal discount factor is applied). At each fixing date, ``_apply_tarf_fixing``
+        applies the udmcTRFPayoff jump: an ITM fixing advances ``A`` by a spot-dependent increment
+        (requiring interpolation along the A grid) and pays the accumulation cashflow, or terminates the
+        deal; an OTM fixing leaves ``A`` unchanged and pays the leveraged/barrier-gated cashflow.
         """
         if maturity <= 0:
             raise ValueError("maturity must be positive")
 
         s_grid = self._spot_grid(lower_frac=0.15, upper_frac=2.8)
-        a_max = max(float(tarf.target_level), 1.0) + max(float(tarf.coupon), 0.0) * 5.0
-        a_grid = np.linspace(0.0, a_max, self.num_target)
-        da = a_grid[1] - a_grid[0]
+        a_lo = min(0.0, tarf.accumulated_value)
+        a_grid = np.linspace(a_lo, tarf.target_level, self.num_target)
 
-        V = np.zeros((len(s_grid), len(a_grid)), dtype=float)
-        trigger = np.maximum(s_grid[:, None] - tarf.target_level, 0.0)
-        for j, a in enumerate(a_grid):
-            V[:, j] = trigger[:, 0] if a >= tarf.target_level else 0.5 * trigger[:, 0]
+        values = np.zeros((len(s_grid), len(a_grid)), dtype=float)
 
-        sigma_sq = self.model.local_vol * self.model.local_vol
-        drift = self.model.rate - self.model.dividend_yield
-        fixing_dates = sorted(float(date) for date in tarf.fixing_dates if 0.0 < float(date) <= maturity)
+        fixing_schedule = _tarf_fixing_schedule(tarf, maturity)
         n_steps = max(30, self.n_steps)
-        times = np.linspace(0.0, maturity, n_steps + 1)
+        times = _tarf_time_grid(fixing_schedule, maturity, n_steps)
 
-        for idx in range(n_steps - 1, -1, -1):
+        for idx in range(len(times) - 2, -1, -1):
             current_time = times[idx]
             dt = times[idx + 1] - times[idx]
+            banded = _tarf_spot_operator(self.model.local_vol, self.model.rate, self.model.dividend_yield, s_grid, dt)
 
-            substeps = 2 if idx == n_steps - 1 or any(np.isclose(current_time, fix_date, atol=1e-8, rtol=1e-8) for fix_date in fixing_dates) else 1
-            sub_dt = dt / substeps
+            new_values = np.empty_like(values)
+            for j in range(len(a_grid)):
+                rhs = values[:, j].copy()
+                rhs[0] = 0.0
+                rhs[-1] = 0.0
+                new_values[:, j] = solve_banded((1, 1), banded, rhs)
+            values = new_values
 
-            for _ in range(substeps):
-                new_values = V.copy()
-                for j in range(len(a_grid)):
-                    s = s_grid
-                    n = len(s)
-                    lower = np.zeros(n - 1, dtype=float)
-                    diag = np.ones(n, dtype=float)
-                    upper = np.zeros(n - 1, dtype=float)
-                    rhs = V[:, j].copy()
+            match = next((k for k, d in fixing_schedule if np.isclose(current_time, d, atol=1e-8, rtol=1e-8)), None)
+            if match is not None:
+                values = _apply_tarf_fixing(tarf, match, s_grid, a_grid, values)
 
-                    for i in range(1, n - 1):
-                        s_i = s[i]
-                        ds_left = s[i] - s[i - 1]
-                        ds_right = s[i + 1] - s[i]
-                        ds = 0.5 * (ds_left + ds_right)
-                        alpha = 0.5 * sigma_sq * (s_i * s_i) / (ds * ds)
-                        beta = drift * s_i / (2.0 * ds)
-                        lower[i - 1] = -sub_dt * (alpha - beta)
-                        diag[i] = 1.0 + sub_dt * (2.0 * alpha + self.model.rate)
-                        upper[i] = -sub_dt * (alpha + beta)
-
-                    rhs[0] = 0.0
-                    rhs[-1] = max(s[-1] - self.model.strike, 0.0)
-                    diag[0] = 1.0
-                    diag[-1] = 1.0
-                    lower[0] = 0.0
-                    upper[-1] = 0.0
-                    banded = np.zeros((3, n), dtype=float)
-                    banded[0, 1:] = upper
-                    banded[1, :] = diag
-                    banded[2, :-1] = lower
-                    new_values[:, j] = solve_banded((1, 1), banded, rhs)
-
-                if len(a_grid) > 1:
-                    for j in range(1, len(a_grid)):
-                        drift_term = tarf.coupon * (new_values[:, j] - new_values[:, j - 1]) / max(da, 1e-6)
-                        new_values[:, j] = new_values[:, j] + sub_dt * drift_term
-                V = np.clip(new_values, 0.0, np.inf)
-
-            if any(np.isclose(current_time, fix_date, atol=1e-8, rtol=1e-8) for fix_date in fixing_dates):
-                V = np.maximum(V, trigger)
-
-        return s_grid, a_grid, np.clip(V, 0.0, np.inf)
+        return s_grid, a_grid, values
 
     def price_tarf(self, tarf: TARFAccumulator, maturity: float) -> float:
         s_grid, a_grid, values = self.solve_tarf_pde(tarf=tarf, maturity=maturity)
-        idx_spot = np.argmin(np.abs(s_grid - self.model.spot))
-        value_at_spot = values[idx_spot, :]
-        price = np.interp(tarf.target_level, a_grid, value_at_spot)
-        price = min(max(price, 1e-8), self.model.spot * 1.5)
-        return float(price * np.exp(-self.model.rate * maturity))
+        idx_spot = int(np.argmin(np.abs(s_grid - self.model.spot)))
+        return float(np.interp(tarf.accumulated_value, a_grid, values[idx_spot, :]))
 
     def compute_greeks(self, strike: float, maturity: float) -> dict[str, float]:
         """Minimal delta/gamma/vega scaffolding that matches the brief's on-grid Greeks design."""
@@ -239,41 +249,14 @@ class ThreeRegimePricer:
             raise ValueError("regime weights must sum to 1")
         self.regime_weights = regime_weights
 
-    def _coupled_spot_operator(self, regime: SingleRegimeLocalVolModel, s_grid: np.ndarray, dt: float) -> np.ndarray:
-        """Build one implicit-Euler spot operator for all accumulation slices."""
-        n = len(s_grid)
-        lower = np.zeros(n - 1, dtype=float)
-        diag = np.ones(n, dtype=float)
-        upper = np.zeros(n - 1, dtype=float)
-        sigma_sq = regime.local_vol * regime.local_vol
-        drift = regime.rate - regime.dividend_yield
-
-        for i in range(1, n - 1):
-            ds_left = s_grid[i] - s_grid[i - 1]
-            ds_right = s_grid[i + 1] - s_grid[i]
-            ds = 0.5 * (ds_left + ds_right)
-            alpha = 0.5 * sigma_sq * s_grid[i] * s_grid[i] / (ds * ds)
-            beta = drift * s_grid[i] / (2.0 * ds)
-            lower[i - 1] = -dt * (alpha - beta)
-            diag[i] = 1.0 + dt * (2.0 * alpha + regime.rate)
-            upper[i] = -dt * (alpha + beta)
-
-        diag[0] = 1.0
-        diag[-1] = 1.0
-        lower[0] = 0.0
-        upper[-1] = 0.0
-        banded = np.zeros((3, n), dtype=float)
-        banded[0, 1:] = upper
-        banded[1, :] = diag
-        banded[2, :-1] = lower
-        return banded
-
     def solve_tarf_coupled_pde(self, tarf: TARFAccumulator, maturity: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Solve three coupled TARF PDE layers on a common (spot, accumulation) grid.
+        """Solve three coupled TARF PDE layers on a common (spot, accumulated) grid.
 
-        The operator split is: implicit spot diffusion per regime, explicit accumulation advection,
-        then exact short-step Q propagation. Splitting keeps each spatial solve tridiagonal while the
-        matrix exponential preserves positivity and the generator's probability structure.
+        Between fixing dates, each regime's slice diffuses independently (implicit spot diffusion via
+        ``_tarf_spot_operator``) and the three regimes are then coupled by an exact short-step Q
+        propagation (``expm(Q * dt)``), which preserves positivity of the generator's probability
+        structure. At each fixing date, ``_apply_tarf_fixing`` is applied per regime to jump the
+        accumulated state and realize that fixing's cashflow, exactly as in the single-regime solve.
         """
         if maturity <= 0.0:
             raise ValueError("maturity must be positive")
@@ -282,47 +265,36 @@ class ThreeRegimePricer:
         s_grid = SingleRegimePricer(reference, num_spot=self.num_spot, num_target=self.num_target)._spot_grid(
             lower_frac=0.15, upper_frac=2.8
         )
-        a_max = max(float(tarf.target_level), 1.0) + max(float(tarf.coupon), 0.0) * 5.0
-        a_grid = np.linspace(0.0, a_max, self.num_target)
-        da = max(a_grid[1] - a_grid[0], 1e-12)
-        trigger = np.maximum(s_grid - tarf.target_level, 0.0)
+        a_lo = min(0.0, tarf.accumulated_value)
+        a_grid = np.linspace(a_lo, tarf.target_level, self.num_target)
         values = np.zeros((3, len(s_grid), len(a_grid)), dtype=float)
-        for regime_index in range(3):
-            values[regime_index] = np.where(a_grid[None, :] >= tarf.target_level, trigger[:, None], 0.5 * trigger[:, None])
 
-        fixing_dates = sorted(float(date) for date in tarf.fixing_dates if 0.0 < float(date) <= maturity)
+        fixing_schedule = _tarf_fixing_schedule(tarf, maturity)
         n_steps = max(30, self.n_steps)
-        times = np.linspace(0.0, maturity, n_steps + 1)
+        times = _tarf_time_grid(fixing_schedule, maturity, n_steps)
         q = self.model.q if self.model.q is not None else np.zeros((3, 3), dtype=float)
         if q.shape != (3, 3):
             raise ValueError("Generator matrix must be 3x3")
 
-        for step_index in range(n_steps - 1, -1, -1):
+        for step_index in range(len(times) - 2, -1, -1):
             current_time = times[step_index]
             dt = times[step_index + 1] - times[step_index]
-            is_event = any(np.isclose(current_time, date, atol=1e-8, rtol=1e-8) for date in fixing_dates)
-            substeps = 2 if step_index == n_steps - 1 or is_event else 1
-            sub_dt = dt / substeps
 
-            for _ in range(substeps):
-                diffused = np.empty_like(values)
-                for regime_index, regime in enumerate(self.model.regimes):
-                    banded = self._coupled_spot_operator(regime, s_grid, sub_dt)
-                    rhs = values[regime_index].copy()
-                    rhs[0, :] = 0.0
-                    rhs[-1, :] = max(s_grid[-1] - regime.strike, 0.0)
-                    diffused[regime_index] = solve_banded((1, 1), banded, rhs)
+            diffused = np.empty_like(values)
+            for regime_index, regime in enumerate(self.model.regimes):
+                banded = _tarf_spot_operator(regime.local_vol, regime.rate, regime.dividend_yield, s_grid, dt)
+                for j in range(len(a_grid)):
+                    rhs = values[regime_index, :, j].copy()
+                    rhs[0] = 0.0
+                    rhs[-1] = 0.0
+                    diffused[regime_index, :, j] = solve_banded((1, 1), banded, rhs)
 
-                for target_index in range(1, len(a_grid)):
-                    diffused[:, :, target_index] += (
-                        sub_dt * tarf.coupon / da * (diffused[:, :, target_index] - diffused[:, :, target_index - 1])
-                    )
+            values = np.einsum("ij,jkl->ikl", expm(q * dt), diffused)
 
-                values = np.einsum("ij,jkl->ikl", expm(q * sub_dt), diffused)
-                values = np.clip(values, 0.0, np.inf)
-
-            if is_event:
-                values = np.maximum(values, trigger[None, :, None])
+            match = next((k for k, d in fixing_schedule if np.isclose(current_time, d, atol=1e-8, rtol=1e-8)), None)
+            if match is not None:
+                for regime_index in range(3):
+                    values[regime_index] = _apply_tarf_fixing(tarf, match, s_grid, a_grid, values[regime_index])
 
         return s_grid, a_grid, values
 
@@ -368,12 +340,10 @@ class ThreeRegimePricer:
         s_grid, a_grid, values = self.solve_tarf_coupled_pde(tarf=tarf, maturity=maturity)
         idx_spot = int(np.argmin(np.abs(s_grid - self.model.spot)))
         regime_values = np.array(
-            [np.interp(tarf.target_level, a_grid, values[regime_index, idx_spot, :]) for regime_index in range(3)],
+            [np.interp(tarf.accumulated_value, a_grid, values[regime_index, idx_spot, :]) for regime_index in range(3)],
             dtype=float,
         )
-        weighted = float(np.dot(self.regime_weights, regime_values))
-        cap = self.model.spot * 1.5
-        return float(min(max(weighted * np.exp(-self.model.rate * maturity), 1e-8), cap))
+        return float(np.dot(self.regime_weights, regime_values))
 
     def price_tarf_coupled(self, tarf: TARFAccumulator, maturity: float) -> float:
         """Generator-matrix-coupled TARF price.
