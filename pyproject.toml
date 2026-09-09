@@ -7,10 +7,12 @@ name = "tarf-rslv-pricer"
 version = "0.1.0"
 description = "Finite-difference TARF pricer with a 3-regime local-vol extension"
 readme = "README.md"
-requires-python = ">=3.10"
+# Front Arena runs an embedded CPython 3.9.7 that cannot be upgraded, so this
+# branch targets that interpreter and the library versions shipped with it.
+requires-python = ">=3.9"
 dependencies = [
-  "numpy>=1.26",
-  "scipy>=1.11",
+  "numpy==1.22.4",
+  "scipy==1.13.1",
 ]
 
 [project.optional-dependencies]
