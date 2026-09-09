@@ -177,6 +177,9 @@ def price_tarf(
     target_adjustment: int = 0,
     inverted_target: bool = False,
     accumulated_value: float = 0.0,
+    num_spot: int = 121,
+    num_target: int = 80,
+    n_steps: int = 80,
 ) -> float:
     """Pure, state-free TARF valuation function used by the AEF wrapper.
 
@@ -184,6 +187,12 @@ def price_tarf(
     accumulation leg while ITM (toward ``target_level``), ``notional2`` pays the leveraged loss while
     OTM (gated by the local, no-memory KI ``barrier``), and ``target_adjustment`` controls how the
     triggering fixing is settled (0 = none, 1 = strike-adjusted, 2 = notional-adjusted).
+
+    ``fixing_times`` are year fractions from the valuation date. Fixings already in the past are
+    dropped; a fixing on the valuation date that has not yet been observed is kept (pass it as ``0.0``
+    or a tiny positive number) and ``accumulated_value`` carries the amount realised by past fixings.
+    ``num_spot`` / ``num_target`` / ``n_steps`` set the finite-difference grid resolution -- raise
+    ``num_target`` for a heavily seasoned deal, where fewer accumulated-amount nodes remain live.
     """
     weights = _validate_vector(regime_weights, "regime_weights")
     if np.any(weights < 0.0) or not np.isclose(weights.sum(), 1.0):
@@ -211,7 +220,13 @@ def price_tarf(
         inverted_target=bool(inverted_target),
         accumulated_value=float(accumulated_value),
     )
-    return ThreeRegimePricer(model=model, regime_weights=weights).price_tarf(tarf, float(maturity))
+    return ThreeRegimePricer(
+        model=model,
+        regime_weights=weights,
+        num_spot=int(num_spot),
+        num_target=int(num_target),
+        n_steps=int(n_steps),
+    ).price_tarf(tarf, float(maturity))
 
 
 def tarf_model(
@@ -233,8 +248,15 @@ def tarf_model(
     target_adjustment: int = 0,
     inverted_target: bool = False,
     accumulated_value: float = 0.0,
+    num_spot: int = 121,
+    num_target: int = 80,
+    n_steps: int = 80,
 ) -> dict[str, object]:
-    """AEF-compatible wrapper; the mandatory return key is ``result``."""
+    """AEF-compatible wrapper; the mandatory return key is ``result``.
+
+    See ``price_tarf`` for the seasoning conventions (past fixings dropped, valuation-date fixing
+    kept, ``accumulated_value`` carries realised amount) and the grid-resolution parameters.
+    """
     value = price_tarf(
         spot=_denominated_number(spot_value, "spot_value"),
         strike=_denominated_number(strike_value, "strike_value"),
@@ -253,6 +275,9 @@ def tarf_model(
         target_adjustment=target_adjustment,
         inverted_target=inverted_target,
         accumulated_value=accumulated_value,
+        num_spot=num_spot,
+        num_target=num_target,
+        n_steps=n_steps,
     )
     return {"result": _make_denominated_value(value, _denominated_unit(strike_value, "strike_value"), valuation_date)}
 
@@ -277,11 +302,15 @@ def tarf_model_from_market_data(
     target_adjustment: int = 0,
     inverted_target: bool = False,
     accumulated_value: float = 0.0,
+    num_spot: int = 121,
+    num_target: int = 80,
+    n_steps: int = 80,
 ) -> dict[str, object]:
     """AEF-compatible wrapper taking real FA market data objects instead of pre-extracted scalars.
 
     domestic_curve/foreign_curve are FIrCurveInformation objects, vol_surface is an
-    FMalzParametricVolatilityInformation object. The mandatory return key is ``result``.
+    FMalzParametricVolatilityInformation object. The mandatory return key is ``result``. See
+    ``price_tarf`` for the seasoning conventions and the grid-resolution parameters.
     """
     market = market_data_from_front_arena(
         valuation_date=valuation_date,
@@ -311,6 +340,9 @@ def tarf_model_from_market_data(
         target_adjustment=target_adjustment,
         inverted_target=inverted_target,
         accumulated_value=accumulated_value,
+        num_spot=num_spot,
+        num_target=num_target,
+        n_steps=n_steps,
     )
     return {"result": _make_denominated_value(value, _denominated_unit(strike_value, "strike_value"), valuation_date)}
 

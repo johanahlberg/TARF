@@ -43,6 +43,21 @@ Matches Luo & Shevchenko:
 - **Discounting** is embedded in the spatial operator, so the price is read straight off the grid at
   `(spot, accumulated_value)`.
 
+### Seasoned deals
+
+`fixing_times` are year fractions **from the valuation date**. Fixings already in the past come
+through negative and are dropped automatically; a fixing on the valuation date that has not yet been
+observed is kept (pass `0.0`) and settled at the current spot, undiscounted. The realised amount from
+past fixings is carried in `accumulated_value` (same units as `target_level` -- CHF-pip intrinsic
+unless `inverted_target`), and the knockout uses `remaining = target_level - accumulated`. Pass
+per-fixing `notional1` / `notional2` as full-length vectors (one per original fixing); indices stay
+aligned with the untrimmed schedule.
+
+The accumulated-amount grid spans `[0, target_level]` regardless of how seasoned the deal is, so a
+deal with little target left has fewer live nodes -- raise `num_target` (the default 80 is converged
+for a fresh deal; ~320 covers a heavily seasoned one). `num_spot` / `num_target` / `n_steps` are
+constructor args on the pricers and trailing keyword args on the `front_arena` wrappers.
+
 The three-regime solve reuses the same operator per regime and couples them with `exp(Q dt)` applied
 after each diffusion sub-step (operator splitting). In the single-regime limit (identical regimes)
 `exp(Q dt)` acts as the identity on the common value, so `ThreeRegimePricer` reduces exactly to
@@ -85,6 +100,8 @@ are lightweight and used by the interface tests.
   reduction, leveraged-loss/barrier economics.
 - `test_tarf_payoff.py` -- `TARFAccumulator.settle` against the ESL per-fixing logic.
 - `test_front_arena_interface.py` -- ACM boundary and serialization adapter checks.
+- `test_seasoned_tarf.py` -- past fixings dropped, valuation-date fixing priced in, grid-resolution
+  passthrough on the `front_arena` wrappers.
 
 ## Front Arena AEF interface
 
@@ -95,6 +112,10 @@ valuation date, and `denominatedvalue` objects for spot and strike; returns a di
 `FMalzParametricVolatilityInformation` objects directly; `front_arena.market_data_from_front_arena`
 is the single boundary function that touches them. ADFL templates are in `front_arena.ADFL_EXAMPLE`
 and `front_arena.ADFL_EXAMPLE_MARKET_DATA`.
+
+Worked examples with mock FA market-data objects are in `examples/` -- `price_usdchf_tarf.py`
+(a fresh USDCHF seller TARF) and `price_seasoned_tarf.py` (the same deal valued mid-life), each with
+a flat-vol Monte-Carlo cross-check. Run e.g. `python examples/price_seasoned_tarf.py`.
 
 ## Run tests
 

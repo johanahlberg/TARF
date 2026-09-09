@@ -190,8 +190,22 @@ def _apply_tarf_fixing(
     return result
 
 
+# A fixing within this many year-fractions of the valuation date (~0.03 s) is read as
+# "fixes today, not yet observed": it is kept and snapped to t = 0 so its jump is applied
+# at the front of the backward march (undiscounted, at the known current spot). Fixings
+# before that are treated as already observed -- their realised amount belongs in
+# ``TARFAccumulator.accumulated_value`` and they must not be re-applied here.
+_FIXING_TIME_TOL = 1e-9
+
+
 def _tarf_fixing_schedule(tarf: TARFAccumulator, maturity: float) -> list[tuple[int, float]]:
-    return [(k, float(d)) for k, d in enumerate(tarf.fixing_dates) if 0.0 < float(d) <= maturity + 1e-12]
+    schedule = []
+    for k, raw in enumerate(tarf.fixing_dates):
+        d = float(raw)
+        if d < -_FIXING_TIME_TOL or d > maturity + _FIXING_TIME_TOL:
+            continue
+        schedule.append((k, max(d, 0.0)))
+    return schedule
 
 
 def _event_times(fixing_schedule: list[tuple[int, float]], maturity: float) -> np.ndarray:
