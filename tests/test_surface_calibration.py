@@ -221,15 +221,23 @@ def test_fxvolsurface_is_svi_backed_and_arbitrage_free():
 def test_calibrate_regime_model_full_pipeline():
     surface = _skew_surface()
     model, report = calibrate_regime_model(
-        surface, [0.25, 0.5, 0.25], spread=0.03, target="hybrid", n_pde_passes=2,
-        num_x=401, steps_per_year=300, dupire_nt=21, dupire_nx=101,
+        surface, [0.25, 0.5, 0.25], level_spread=0.15, skew_spread=0.12,
+        target="hybrid", n_pde_passes=2, num_x=401, steps_per_year=300, dupire_nt=21, dupire_nx=101,
     )
-    assert report.rms_vol_error < 8e-4
+    assert report.rms_vol_error < 1e-3          # regime dispersion costs ~2 bp vs pure Dupire
     assert report.max_butterfly_violation < 1e-3
     assert report.max_calendar_violation < 5e-3
     assert report.switch_rate > 0.0
+    assert report.level_spread == 0.15 and report.skew_spread == 0.12
     assert model.time_varying
     assert np.allclose(model.q.sum(axis=1), 0.0, atol=1e-12)
+
+    # regimes genuinely differ in BOTH level and skew
+    f = surface.forward(0.5)
+    lv = np.array([r.local_volatility(f * np.exp([-0.05, 0.0, 0.05]), 0.5) for r in model.regimes])
+    assert lv[0, 1] < lv[1, 1] < lv[2, 1]                       # ATM level: calm < mid < stressed
+    skew = lv[:, 0] - lv[:, 2]                                  # put minus call wing
+    assert skew[0] < skew[1] < skew[2]                          # stressed regime is steeper-skew
 
     tarf = TARFAccumulator(
         target_level=0.10, strike=0.82, fixing_dates=tuple((k + 1) / 12 for k in range(12)),

@@ -71,16 +71,18 @@ def main() -> None:
     print(f"\n  Arbitrage-free SVI surface fit: RMS {surface.svi_report.rms_vol_error * 1e4:.2f} bp, "
           f"butterfly {surface.svi_report.max_butterfly_violation:.1e}, "
           f"calendar {surface.svi_report.max_calendar_violation:.1e}")
-    print("\n  Calibrating full 3-regime model (SVI smile + dispersion, analytic Dupire local vol,")
-    print("  forward regime-switching PDE, then the switch rate) ...")
+    print("\n  Calibrating full 3-regime model (SVI (a,b) per tenor -> analytic Dupire -> forward")
+    print("  regime-switching PDE; regimes differ in level AND skew; then the switch rate) ...")
     t0 = time.time()
-    model, report = calibrate_regime_model(surface, REGIME_WEIGHTS, spread=0.03, verbose=True)
+    model, report = calibrate_regime_model(surface, REGIME_WEIGHTS, verbose=True)
     print(f"  -> {time.time() - t0:.1f}s   RMS {report.rms_vol_error * 1e4:.2f} bp   "
           f"max {report.max_vol_error * 1e4:.2f} bp")
     print(f"     residual arbitrage: butterfly {report.max_butterfly_violation:.1e}, "
           f"calendar {report.max_calendar_violation:.1e}")
-    print(f"     switch rate {report.switch_rate:.2f}/yr  (identified from the BF term structure: "
-          f"{report.switch_rate_identified})")
+    print(f"     regime structure (prior): level_spread {report.level_spread}, "
+          f"skew_spread {report.skew_spread}")
+    print(f"     switch rate {report.switch_rate:.2f}/yr  "
+          f"(identified from the RR/BF term structure: {report.switch_rate_identified})")
 
     # per-tenor fit error
     print("\n  Fit error by tenor (model implied vol - market, bp)")

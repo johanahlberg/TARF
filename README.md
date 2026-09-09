@@ -116,39 +116,48 @@ comparison.
   are its own asymptotically-linear continuation -- and every derivative Dupire needs is **analytic**
   (Gatheral total-variance form), so there is no spline, no finite-difference Dupire, and no separate
   wing rule. `FXVolSurface.svi_report` carries the fit error and residual arbitrage.
-- **Model side**. Free variables: per tenor the SVI level/skew-scale `(a, b)`, with the shape
-  `(rho, m, sigma)` frozen from the market fit -- so a candidate slice is linear in the free
-  variables and needs no inner fit. Regime `i` is the base slice with total variance scaled by
-  `(1 +- spread)^2`. Each regime slice -> its analytic Dupire surface -> the model's own implied-vol
-  surface via the **forward regime-switching PDE** (`vanilla.py`).
-- **The fit** (`target="hybrid"`, default) optimises against a smooth mixture surrogate and
-  re-anchors it `n_pde_passes` times with the forward-PDE-minus-mixture correction -- fast, robust,
-  converges to a PDE-accurate fit (~0.6 bp RMS on a 10-tenor surface in ~17 s). `target="pde"`
-  optimises the PDE directly (literal but noise-sensitive near the optimum -- `hybrid` is
-  preferred); `target="mixture"` is the surrogate alone (~few bp, ~1 s). Tenors below ~2 weeks use
-  the mixture (exact there; the PDE cannot resolve a near-degenerate density).
+- **Model side -- genuinely regime-driven.** The three regimes differ from the base SVI slice in
+  **level and skew**:
+
+  ```
+  regime i:  a, b  ->  a, b * (1 + m_i * level_spread)^2      m = (-1, 0, +1)
+             rho   ->  rho - m_i * skew_spread
+  ```
+
+  so the stressed regime is higher-vol *and* steeper-skew. `level_spread` / `skew_spread` are a
+  **regime interpretation, not calibrated** -- a static vanilla surface does not identify regime
+  dispersion (free it in the fit and it collapses to zero; forward-vol data would identify it).
+  Defaults `0.18 / 0.15` = calm / mid / stressed with the stressed vol ~1.4x and skew ~3x the calm
+  regime; override per your realised-vol regime study. Each regime slice -> its analytic Dupire
+  surface -> the model's implied-vol surface via the **forward regime-switching PDE** (`vanilla.py`).
+- **The fit** frees per tenor only the SVI level / wing-scale `(a, b)` (shape frozen -- freeing
+  `sigma` too is ill-conditioned), driven by `target="hybrid"` (default): a smooth mixture surrogate
+  inside the optimiser, re-anchored `n_pde_passes` times by the forward-PDE correction (damped).
+  ~2 bp RMS / ~5 bp max on a 10-tenor surface in ~15 s -- the strong regime dispersion costs ~2 bp
+  of surface fit vs a pure Dupire model, mostly a systematic ~3-5 bp bias at the 10d wings (the
+  `(a, b)` freedom cannot re-shape the smile). `target="pde"` / `target="mixture"` are also
+  available. Tenors below ~2 weeks use the mixture (exact there).
+- **Stage 2** fits the scalar switch rate of `Q = rate (1 pi^T - I)` to the model's 25d **RR and BF
+  term structures** from the forward PDE (the mixture surrogate is switch-rate-blind when the regime
+  distribution starts stationary). It is only weakly identified (~a few bp of response over the
+  whole rate range): a coarse grid, falling back to a persistence prior (regimes ~6 months) when the
+  term structure does not respond -- `report.switch_rate_identified` says which.
 
 The result is a `CalibratedRegimeModel` -- three **time-dependent** Dupire regimes plus the
 generator -- and `ThreeRegimePricer` rebuilds its FD operators per segment when `model.time_varying`.
 Vega on a calibrated model is a parallel shift of the whole local-vol surface.
-
-**Stage 2** fits the scalar switch rate of `Q = rate (1 pi^T - I)` to the market **25d butterfly
-term structure** -- the smile-flattening-with-maturity that switching controls in a level-dispersion
-regime model. It is only weakly identified by vanillas: the fit is bounded, `pi0` defaults to the
-slope of the ATM term structure, and it falls back to a persistence prior (regimes ~6 months) when
-the butterfly term structure barely responds -- `report.switch_rate_identified` says which happened.
-Set `calibrate_q=False`, or pass `q=`, to override.
 
 Front Arena entry points: `market_surface_from_front_arena` (queries a delta-parametrised vol object
 at +-10d/+-25d/ATM -- expects a full surface), `fx_surface_from_quotes` (quote arrays +
 `FIrCurveInformation` objects), and `calibrated_tarf_model_from_surface` (calibrate + price in one
 call; `result` plus the fit report). Worked example: `examples/calibrate_usdchf_surface.py`.
 
-Remaining limitations: SVI slices are fitted independently in the calibration loop (frozen shape),
-so a joint calendar guarantee holds only up to the small `report.max_calendar_violation` (checked on
-+-90% log-moneyness, well past any traded strike); the frozen SVI shape means the deep 10d wings can
-carry ~1-2 bp of fit error; the switch rate is weakly identified (above). SSVI with a globally
-coupled term structure is the next refinement.
+Remaining limitations: regime dispersion (`level_spread` / `skew_spread`) and, largely, the switch
+rate are **not identified by vanillas** -- they are priors, and forward-starting vol quotes are what
+would pin them; the frozen SVI shape leaves ~3-5 bp of systematic wing bias under strong dispersion;
+SVI slices are fitted independently (joint calendar-arb holds only up to the small
+`report.max_calendar_violation`, checked on +-90% log-moneyness). SSVI with a globally coupled term
+structure, and a forward-vol calibration target, are the next refinements.
 
 ## Tests
 

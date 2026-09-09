@@ -461,7 +461,8 @@ def calibrated_tarf_model_from_surface(
     *,
     regime_weights: Sequence[float] = (0.25, 0.5, 0.25),
     q_matrix: Sequence[Sequence[float]] | None = None,
-    regime_spread: float = 0.03,
+    regime_level_spread: float = 0.04,
+    regime_skew_spread: float = 0.10,
     is_call_option: bool = True,
     notional1: Sequence[float] | float = 1.0,
     notional2: Sequence[float] | float = 1.0,
@@ -482,7 +483,8 @@ def calibrated_tarf_model_from_surface(
     weights = np.asarray(regime_weights, dtype=float)
     q = None if q_matrix is None else np.asarray(q_matrix, dtype=float)
     model, report = calibrate_regime_model(
-        surface, weights, q=q, spread=regime_spread, calibrate_q=calibrate_q, **(calibration_kwargs or {})
+        surface, weights, q=q, level_spread=regime_level_spread, skew_spread=regime_skew_spread,
+        calibrate_q=calibrate_q, **(calibration_kwargs or {})
     )
 
     tarf = TARFAccumulator(
@@ -510,7 +512,10 @@ def calibrated_tarf_model_from_surface(
             "svi_rms_vol_error": surface.svi_report.rms_vol_error if surface.svi_report else None,
             "max_butterfly_violation": report.max_butterfly_violation,
             "max_calendar_violation": report.max_calendar_violation,
+            "level_spread": report.level_spread,
+            "skew_spread": report.skew_spread,
             "switch_rate": report.switch_rate,
+            "switch_rate_identified": report.switch_rate_identified,
             "success": report.success,
         },
     }

@@ -6,14 +6,18 @@
 **SVI** slice (``svi.fit_svi_surface``); the calibration then moves only that slice's level /
 skew-scale ``(a, b)`` per tenor, with the shape ``(rho, m, sigma)`` frozen -- so a candidate slice is
 linear in the free variables and needs no inner fit. Regime ``i`` is the base slice with total
-variance scaled by ``(1 +- spread)^2``; each regime slice gives an **analytic Dupire** local-vol
-surface; and the model's own implied-vol surface -- the forward regime-switching PDE of
-:mod:`tarf_rslv.vanilla` -- is driven onto the market surface by least squares over the ``(a, b)``.
+variance scaled by ``(1 +- level_spread)^2`` **and** ``rho`` shifted by ``-+ skew_spread`` -- the
+stressed regime is higher-vol *and* steeper-skew. Those two structural scalars are a regime
+interpretation, not calibrated (see :class:`SharedSmileParams`). Each regime slice gives an
+**analytic Dupire** local-vol surface, and the model's own implied-vol surface -- the forward
+regime-switching PDE of :mod:`tarf_rslv.vanilla` -- is driven onto the market by least squares over
+the ``(a, b)``.
 
 **Stage 2 -- switching speed.** ``calibrate_switch_rate`` fits the scalar rate of
-``Q = rate (1 pi^T - I)`` so the model's 25d **butterfly** term structure matches the market's --
-the smile-flattening-with-maturity that the switch rate controls in a level-dispersion regime model.
-It is only weakly identified by vanillas; the fit is bounded and falls back to a persistence prior.
+``Q = rate (1 pi^T - I)`` so the model's 25d **RR and BF** term structures (from the forward PDE)
+match the market's decay with maturity -- the smile-flattening the switch rate controls. It is only
+weakly identified by vanillas (~a few bp of response); the fit is a coarse grid and falls back to a
+persistence prior when the term structure does not respond.
 
 The result is a :class:`CalibratedRegimeModel` -- three time-dependent Dupire regimes plus the
 generator -- which plugs straight into ``ThreeRegimePricer``.
@@ -35,11 +39,12 @@ REGIME_MULTIPLIERS = np.array([-1.0, 0.0, 1.0])
 PDE_MIN_TENOR = 1.0 / 26.0                     # ~2 weeks; below this the forward PDE uses the mixture
 _SVI_LO = np.array([-2.0, 1e-4, -0.999, -1.5, 1e-3])
 _SVI_HI = np.array([2.0, 3.0, 0.999, 1.5, 1.5])
-_PRIOR_SWITCH_RATE = 2.0                       # regimes persist ~6 months when stage 2 is unidentified
-
-
-def _regime_variance_multiplier(spread: float, regime: int) -> float:
-    return float((1.0 + REGIME_MULTIPLIERS[regime] * spread) ** 2)
+_PRIOR_SWITCH_RATE = 2.0                       # regimes persist ~6 months when the rate is unidentified
+# Default regime interpretation (structural priors -- not identified by a static surface):
+#   vol multipliers ~ (1 - 0.18, 1, 1 + 0.18) = calm / mid / stressed
+#   the stressed regime also carries rho shifted by -0.15 (steeper put skew)
+_DEFAULT_LEVEL_SPREAD = 0.18
+_DEFAULT_SKEW_SPREAD = 0.15
 
 
 # --------------------------------------------------------------------------------------------------
@@ -47,15 +52,27 @@ def _regime_variance_multiplier(spread: float, regime: int) -> float:
 # --------------------------------------------------------------------------------------------------
 @dataclass
 class SharedSmileParams:
-    """Per-tenor SVI with the **shape** ``(rho, m, sigma)`` frozen from the market fit and the
-    **level / skew-scale** ``(a, b)`` free -- so a candidate slice is linear in the free variables
-    and needs no inner fit. ``spread`` sets the regime vol dispersion."""
+    """Per-tenor SVI with the shape ``(rho, m, sigma)`` frozen from the market fit and the level /
+    wing-scale ``(a, b)`` free -- a candidate slice is analytic in those, no inner fit. (Freeing
+    ``sigma`` as well is poorly conditioned and thrashes the optimiser, so the residual ~2 bp of
+    wing-shape mismatch under strong regime dispersion is accepted, not chased.)
+
+    Two global structural scalars set how the three regimes differ from the base slice:
+
+        regime i:  a, b   ->  a, b  * (1 + m_i * level_spread)^2      (level / vol dispersion)
+                   rho    ->  rho - m_i * skew_spread                 (skew dispersion)
+
+    with ``m = (-1, 0, +1)`` -- so the high-vol regime is also the steeper-skew regime. These are
+    **not** identified by a static vanilla surface (free them in the fit and they collapse to zero),
+    so they are set from a regime interpretation / realised-vol prior, not calibrated.
+    """
 
     tenors: np.ndarray
-    shape: np.ndarray                # (N, 3): rho, m, sigma  (fixed)
-    ab: np.ndarray                   # (N, 2): a, b           (free)
-    spread: float
-    ab0: np.ndarray                  # the market-fit (a, b), for the bounding box
+    frozen: np.ndarray               # (N, 3): rho, m, sigma   (fixed)
+    free: np.ndarray                 # (N, 2): a, b            (free)
+    level_spread: float              # structural prior
+    skew_spread: float               # structural prior
+    free0: np.ndarray                # the market-fit (a, b), for the bounding box
 
     @property
     def n_buckets(self) -> int:
@@ -63,32 +80,39 @@ class SharedSmileParams:
 
     def slices(self) -> list[SVISlice]:
         return [
-            SVISlice(float(self.tenors[b]), float(self.ab[b, 0]), float(self.ab[b, 1]),
-                     float(self.shape[b, 0]), float(self.shape[b, 1]), float(self.shape[b, 2]))
+            SVISlice(float(self.tenors[b]), float(self.free[b, 0]), float(self.free[b, 1]),
+                     float(self.frozen[b, 0]), float(self.frozen[b, 1]), float(self.frozen[b, 2]))
             for b in range(self.n_buckets)
         ]
 
     def free_vector(self) -> np.ndarray:
-        return self.ab.ravel()
+        return self.free.ravel()
 
     def with_free_vector(self, vector: np.ndarray) -> "SharedSmileParams":
-        return replace(self, ab=np.asarray(vector, dtype=float).reshape(self.n_buckets, 2))
+        return replace(self, free=np.asarray(vector, dtype=float).reshape(self.n_buckets, 2))
 
     def bounds(self) -> tuple[np.ndarray, np.ndarray]:
-        a0, b0 = self.ab0[:, 0], self.ab0[:, 1]
+        a0, b0 = self.free0[:, 0], self.free0[:, 1]
         lo = np.stack([a0 - 0.02, np.maximum(b0 * 0.4, 1e-4)], axis=1).ravel()
         hi = np.stack([a0 + 0.02, b0 * 2.2 + 0.02], axis=1).ravel()
         return lo, hi
 
     def regime_slices(self, regime: int) -> list[SVISlice]:
-        mult = _regime_variance_multiplier(self.spread, regime)
-        return [s.scaled(mult) for s in self.slices()]
+        m = REGIME_MULTIPLIERS[regime]
+        var_mult = (1.0 + m * self.level_spread) ** 2
+        rho_shift = m * self.skew_spread
+        return [
+            SVISlice(s.tenor, s.a * var_mult, s.b * var_mult,
+                     min(max(s.rho - rho_shift, -0.999), 0.999), s.m, s.sigma)
+            for s in self.slices()
+        ]
 
     @classmethod
-    def from_surface(cls, surface: FXVolSurface, spread: float) -> "SharedSmileParams":
-        shape = np.array([[s.rho, s.m, s.sigma] for s in surface.svi_slices], dtype=float)
-        ab = np.array([[s.a, s.b] for s in surface.svi_slices], dtype=float)
-        return cls(np.asarray(surface._tenors, dtype=float), shape, ab.copy(), float(spread), ab.copy())
+    def from_surface(cls, surface: FXVolSurface, level_spread: float, skew_spread: float) -> "SharedSmileParams":
+        frozen = np.array([[s.rho, s.m, s.sigma] for s in surface.svi_slices], dtype=float)
+        free = np.array([[s.a, s.b] for s in surface.svi_slices], dtype=float)
+        return cls(np.asarray(surface._tenors, dtype=float), frozen, free.copy(),
+                   float(level_spread), float(skew_spread), free.copy())
 
 
 # --------------------------------------------------------------------------------------------------
@@ -166,7 +190,7 @@ def _build_model(surface, params, q, weights, x_grid, t_grid, max_t):
     regimes = [
         _LocalVolRegime(
             x_grid, t_grid, grids[i], surface.domestic_zero(max_t), surface.foreign_zero(max_t),
-            front_atm * (1.0 + REGIME_MULTIPLIERS[i] * params.spread), surface.vol_floor,
+            front_atm * (1.0 + REGIME_MULTIPLIERS[i] * params.level_spread), surface.vol_floor,
         )
         for i in range(3)
     ]
@@ -253,6 +277,8 @@ class SurfaceCalibrationReport:
     svi_rms_vol_error: float
     max_butterfly_violation: float
     max_calendar_violation: float
+    level_spread: float
+    skew_spread: float
     switch_rate: float
     switch_rate_identified: bool
     n_pde_passes: int
@@ -272,63 +298,66 @@ def _arbitrage_diagnostics(params: SharedSmileParams) -> tuple[float, float]:
     return bf, cal
 
 
-def _infer_pi0(surface: FXVolSurface, weights: np.ndarray) -> np.ndarray:
-    atm = np.array([s.atm for s in surface.smiles], dtype=float)
-    slope = (atm[-1] - atm[0]) / max(atm[0], 1e-6)
-    tilt = float(np.clip(-slope * 2.0, -0.45, 0.45))   # upward term structure -> weight the low regime
-    raw = weights * np.array([1.0 - tilt, 1.0, 1.0 + tilt])
-    return raw / raw.sum()
-
-
 # --------------------------------------------------------------------------------------------------
-# stage 2: switch rate from the 25d butterfly term structure
+# stage 2: switch rate from the 25d risk-reversal + butterfly term structure
 # --------------------------------------------------------------------------------------------------
 def _generator(rate: float, stationary: np.ndarray) -> np.ndarray:
     return rate * (np.ones((3, 1)) @ stationary[None, :] - np.eye(3))
 
 
+def _rr_bf_term_structure_from_iv(iv_by_tenor: dict[float, np.ndarray], tenors) -> tuple[np.ndarray, np.ndarray]:
+    """``iv_by_tenor[t]`` holds ``[25dP, ATM, 25dC]``; returns ``(RR(T), BF(T))``."""
+    rr = np.array([iv_by_tenor[t][2] - iv_by_tenor[t][0] for t in tenors])
+    bf = np.array([0.5 * (iv_by_tenor[t][2] + iv_by_tenor[t][0]) - iv_by_tenor[t][1] for t in tenors])
+    return rr, bf
+
+
 def calibrate_switch_rate(
     model: CalibratedRegimeModel,
-    pi0: np.ndarray,
     *,
+    num_x: int = 501,
+    steps_per_year: int = 400,
     rate_bounds: tuple[float, float] = (0.2, 12.0),
 ) -> tuple[float, bool]:
-    """Fit the switch rate so the model's 25d butterfly term structure matches the market's.
-
-    Returns ``(rate, identified)``; ``identified`` is ``False`` (and ``rate`` the persistence prior)
-    when the butterfly term structure barely responds to the rate.
-    """
+    """Fit the switch rate so the model's 25d **RR and BF term structures** (from the forward PDE --
+    the mixture surrogate is switch-rate-blind when the regime distribution starts stationary) match
+    the market's decay with maturity. Returns ``(rate, identified)``; ``identified`` is ``False``
+    (rate = the persistence prior) when neither term structure responds to the rate."""
     surface = model.surface
-    tenors = np.array([s.tenor for s in surface.smiles], dtype=float)
-    stationary = model.regime_weights
-    knot_k = surface._knot_y
-
-    market_bf = []
-    for slc, k in zip(surface.svi_slices, knot_k):
-        iv = np.asarray(slc.implied_vol(np.array([k[1], 0.0, k[-2]])), dtype=float)  # 25dP, ATM, 25dC
-        market_bf.append(0.5 * (iv[0] + iv[2]) - iv[1])
-    market_bf = np.array(market_bf)
-
-    def model_bf(rate: float) -> np.ndarray:
-        m = replace(model, q=_generator(rate, stationary))
-        vals = np.empty(len(tenors))
-        for j, (k, t) in enumerate(zip(knot_k, tenors)):
-            pi_bar = _time_averaged_regime_probs(m.q, stationary, float(t))
-            iv = _mixture_implied_vol(m, float(t), np.array([k[1], 0.0, k[-2]]), pi_bar)
-            vals[j] = 0.5 * (iv[0] + iv[2]) - iv[1]
-        return vals
-
-    bf_lo, bf_hi = model_bf(rate_bounds[0]), model_bf(rate_bounds[1])
-    if np.max(np.abs(bf_hi - bf_lo)) < 2e-5:            # < 0.2 bp swing -> not identified
+    tenors = [float(s.tenor) for s in surface.smiles if s.tenor >= PDE_MIN_TENOR]
+    if len(tenors) < 3:
         return _PRIOR_SWITCH_RATE, False
+    knot_k = {float(s.tenor): k for s, k in zip(surface.smiles, surface._knot_y)}
 
-    def objective(rate: float) -> float:
-        return float(np.sum((model_bf(rate) - market_bf) * tenors))
+    market: dict[float, np.ndarray] = {}
+    for s, k in zip(surface.smiles, surface._knot_y):
+        if float(s.tenor) in tenors:
+            market[float(s.tenor)] = np.asarray(
+                next(sl for sl in surface.svi_slices if sl.tenor == s.tenor).implied_vol(
+                    np.array([k[1], 0.0, k[-2]])), dtype=float)
+    m_rr, m_bf = _rr_bf_term_structure_from_iv(market, tenors)
+    weight = np.array(tenors)
 
-    g_lo, g_hi = objective(rate_bounds[0]), objective(rate_bounds[1])
-    if np.sign(g_lo) == np.sign(g_hi):
-        return (rate_bounds[0] if abs(g_lo) < abs(g_hi) else rate_bounds[1]), True
-    return float(brentq(objective, *rate_bounds, xtol=1e-6)), True
+    bf_nodes = [(t, float(k), 0.0, 0.0) for t in tenors for k in (knot_k[t][1], 0.0, knot_k[t][-2])]
+
+    def model_rr_bf(rate: float) -> tuple[np.ndarray, np.ndarray]:
+        m = replace(model, q=_generator(rate, model.regime_weights))
+        iv = _pde_implied_vol_nodes(m, bf_nodes, num_x=num_x, steps_per_year=steps_per_year)
+        by_t = {t: iv[3 * i:3 * i + 3] for i, t in enumerate(tenors)}
+        return _rr_bf_term_structure_from_iv(by_t, tenors)
+
+    # coarse grid -- the RR/BF-vs-rate response is only a few bp over the whole range, so a fine
+    # optimiser would chase noise
+    grid = np.array([0.3, 0.7, 1.5, 3.0, 6.0, 10.0])
+    curves = {r: model_rr_bf(float(r)) for r in grid}
+    obj = np.array([
+        float(np.sum(((curves[r][0] - m_rr) ** 2 + (curves[r][1] - m_bf) ** 2) * weight)) for r in grid
+    ])
+    rr_swing = max(np.max(np.abs(c[0] - curves[grid[0]][0])) for c in curves.values())
+    bf_swing = max(np.max(np.abs(c[1] - curves[grid[0]][1])) for c in curves.values())
+    if max(rr_swing, bf_swing) < 3e-4 or (obj.max() - obj.min()) < 0.05 * obj.max():
+        return _PRIOR_SWITCH_RATE, False
+    return float(grid[int(np.argmin(obj))]), True
 
 
 # kept for backward compatibility / direct use
@@ -370,26 +399,32 @@ def calibrate_regime_model(
     surface: FXVolSurface,
     regime_weights: np.ndarray | list[float] = (0.25, 0.5, 0.25),
     *,
-    spread: float = 0.03,
+    level_spread: float = _DEFAULT_LEVEL_SPREAD,
+    skew_spread: float = _DEFAULT_SKEW_SPREAD,
     calibrate_q: bool = True,
-    pi0: np.ndarray | list[float] | None = None,
     q: np.ndarray | None = None,
     target: str = "hybrid",
-    n_pde_passes: int = 4,
+    n_pde_passes: int = 3,
     q_refit_passes: int = 2,
     num_x: int = 701,
     steps_per_year: int = 600,
     dupire_nt: int = 41,
     dupire_nx: int = 161,
-    max_nfev_inner: int = 120,
+    max_nfev_inner: int = 140,
     verbose: bool = False,
 ) -> tuple[CalibratedRegimeModel, SurfaceCalibrationReport]:
     """Calibrate the full three-regime model to ``surface``.
 
+    Stage 1 fits per-tenor SVI ``(a, b)`` so the model reprices the whole surface, *given* the
+    structural priors ``level_spread`` (regime vol dispersion) and ``skew_spread`` (regime skew
+    dispersion) -- these are a regime interpretation, not calibrated (a static surface does not
+    identify them; free them and they go to zero). Stage 2 (``calibrate_q``) fits the switch rate
+    to the RR/BF **decay** with maturity via the forward PDE -- weakly identified, bounded, with a
+    persistence-prior fallback (``report.switch_rate_identified``).
+
     ``target``: ``"hybrid"`` (default) fits a smooth mixture surrogate inside the optimiser and
-    re-anchors it ``n_pde_passes`` times with the forward-PDE correction -- fast, robust, converges
-    to a PDE-accurate fit. ``"pde"`` fits the forward PDE directly (literal but noisier).
-    ``"mixture"`` is the surrogate only.
+    re-anchors it ``n_pde_passes`` times with the forward-PDE correction. ``"pde"`` fits the forward
+    PDE directly (noisier near the optimum); ``"mixture"`` is the surrogate only.
     """
     weights = np.asarray(regime_weights, dtype=float)
     if weights.shape != (3,) or not np.isclose(weights.sum(), 1.0):
@@ -403,7 +438,7 @@ def calibrate_regime_model(
     vega_w = np.array([w for _, _, _, w in nodes])
     vega_w = vega_w / vega_w.mean()
 
-    template = SharedSmileParams.from_surface(surface, spread)
+    template = SharedSmileParams.from_surface(surface, level_spread, skew_spread)
     tenors = template.tenors
     n = template.n_buckets
     max_t = float(tenors[-1])
@@ -445,8 +480,9 @@ def calibrate_regime_model(
 
             if target == "hybrid" and outer < passes - 1:
                 model = _build_model(surface, template.with_free_vector(x), q_, weights, x_grid, t_grid, max_t)
-                correction = (_pde_implied_vol_nodes(model, nodes, num_x=num_x, steps_per_year=steps_per_year)
-                              - _mixture_implied_vol_nodes(model, nodes))
+                new_corr = (_pde_implied_vol_nodes(model, nodes, num_x=num_x, steps_per_year=steps_per_year)
+                            - _mixture_implied_vol_nodes(model, nodes))
+                correction = new_corr if outer == 0 else 0.6 * new_corr + 0.4 * correction  # damped
             if verbose:
                 model = _build_model(surface, template.with_free_vector(x), q_, weights, x_grid, t_grid, max_t)
                 chk = _pde_implied_vol_nodes(model, nodes, num_x=num_x, steps_per_year=steps_per_year)
@@ -460,8 +496,7 @@ def calibrate_regime_model(
     switch_rate, identified = _PRIOR_SWITCH_RATE, False
     if calibrate_q:
         model = _build_model(surface, template.with_free_vector(x), q, weights, x_grid, t_grid, max_t)
-        pi_now = _infer_pi0(surface, weights) if pi0 is None else np.asarray(pi0, dtype=float)
-        switch_rate, identified = calibrate_switch_rate(model, pi_now)
+        switch_rate, identified = calibrate_switch_rate(model)
         q = _generator(switch_rate, weights)
         if verbose:
             print(f"  [stage2] switch rate = {switch_rate:.3f} / year  (identified={identified})")
@@ -471,7 +506,7 @@ def calibrate_regime_model(
     params = template.with_free_vector(x)
     bf_viol, cal_viol = _arbitrage_diagnostics(params)
     if bf_viol > 5e-4 or cal_viol > 1e-3:                  # nudge the wing scale down to clear it
-        params.ab[:, 1] = np.minimum(params.ab[:, 1], template.ab0[:, 1] * 1.4)
+        params.free[:, 1] = np.minimum(params.free[:, 1], template.free0[:, 1] * 1.4)
         bf_viol, cal_viol = _arbitrage_diagnostics(params)
 
     model = _build_model(surface, params, q, weights, x_grid, t_grid, max_t)
@@ -486,6 +521,8 @@ def calibrate_regime_model(
         svi_rms_vol_error=float(surface.svi_report.rms_vol_error) if surface.svi_report else float("nan"),
         max_butterfly_violation=bf_viol,
         max_calendar_violation=cal_viol,
+        level_spread=float(params.level_spread),
+        skew_spread=float(params.skew_spread),
         switch_rate=switch_rate,
         switch_rate_identified=identified,
         n_pde_passes=passes,
@@ -495,6 +532,9 @@ def calibrate_regime_model(
 
 
 def calibrate_regime_surface(surface, regime_weights=(0.25, 0.5, 0.25), q=None, **kwargs):
-    """Backward-compatible alias: stage 1 only unless ``calibrate_q=True`` is passed."""
+    """Backward-compatible alias: stage 1 only unless ``calibrate_q=True`` is passed. Accepts the old
+    ``spread=`` keyword as ``level_spread``."""
+    if "spread" in kwargs:
+        kwargs["level_spread"] = kwargs.pop("spread")
     kwargs.setdefault("calibrate_q", False)
     return calibrate_regime_model(surface, regime_weights, q=q, **kwargs)
