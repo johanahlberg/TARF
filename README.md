@@ -17,8 +17,10 @@ three-regime layer is an operator-split extension of the same scheme.
 - `src/tarf_rslv/solver.py`: `SingleRegimePricer` and `ThreeRegimePricer` -- the finite-difference
   engine (see *Numerical scheme* below) and on-grid Greeks.
 - `src/tarf_rslv/calibration.py`: the compact two-stage calibration (single tenor; see *Calibration*).
+- `src/tarf_rslv/svi.py`: arbitrage-free SVI slices (butterfly + calendar constrained) with analytic
+  Dupire local volatility.
 - `src/tarf_rslv/vol_surface.py`: FX surface layer -- broker quotes (ATM, 25d/10d RR/BF, market
-  strangles) to a 5-point smile per tenor, delta/strike conventions, implied- and Dupire local-vol.
+  strangles) to a 5-point smile per tenor, delta/strike conventions, one SVI slice per tenor.
 - `src/tarf_rslv/vanilla.py`: `RegimeForwardPDE` -- the model's own implied-vol surface from a forward
   Fokker-Planck solve for the joint (log-spot, regime) density. The calibration target.
 - `src/tarf_rslv/calibration_surface.py`: full-surface calibration (see *Full vol-surface calibration*).
@@ -97,45 +99,56 @@ are lightweight and used by the interface tests.
 
 ## Full vol-surface calibration
 
-`calibration_surface.calibrate_regime_surface` fits the three-regime model to a **whole FX vol
-surface** -- every tenor, and five strikes per tenor (10d put, 25d put, ATM, 25d call, 10d call).
+`calibration_surface.calibrate_regime_model` fits the three-regime model to a **whole FX vol
+surface** -- every tenor, five strikes per tenor (10d put, 25d put, ATM, 25d call, 10d call) -- and
+returns a `CalibratedRegimeModel` ready for `ThreeRegimePricer`. This is the production path;
+`front_arena.calibrated_tarf_model_from_surface` is its AEF wrapper. The legacy
+`tarf_model_from_market_data` (three delta points used as flat regime vols) is kept only for
+comparison.
 
-- **Market side** (`vol_surface.py`). Broker quotes per tenor are `atm`, `rr25`, `bf25`, `rr10`,
-  `bf10`; the butterflies are **market strangles**, so each wing's smile vols are recovered by the
-  price-matching root-find (Reiswich & Wystup). Delta<->strike uses configurable conventions
-  (`DeltaConvention`: spot/forward delta, premium adjustment, ATM = DNS / forward / spot). The
-  surface interpolates cubically in log-moneyness (linear wings) and linearly in total variance
-  across tenors, and yields a **Dupire local-vol** surface (Gatheral total-variance form).
-- **Model side**. A shared base implied smile per tenor (five numbers = the five quotes) plus one
-  regime vol-dispersion `spread`; the three regimes are the base smile scaled by
-  `(1 - spread, 1, 1 + spread)`. Each regime's implied smile -> its Dupire local-vol surface ->
-  the model's own implied-vol surface via the **forward regime-switching PDE** (`vanilla.py`).
-- **The fit** drives the model surface onto the market surface by least squares over the shared-smile
-  parameters. `target="hybrid"` (default) optimises against a smooth mixture surrogate and
-  re-anchors it `n_pde_passes` times with the forward-PDE-minus-mixture correction -- fast and
-  robust, and converges to a PDE-accurate fit (~0.3 bp RMS on a 10-tenor surface in ~20 s).
-  `target="pde"` optimises the PDE directly (literal, slower, noise-sensitive); `target="mixture"`
-  is the surrogate alone (~5 bp, ~1 s). Tenors below ~2 weeks use the mixture (exact there; the PDE
-  cannot resolve a near-degenerate density).
+- **Market side** (`vol_surface.py`, `svi.py`). Broker quotes per tenor are `atm`, `rr25`, `bf25`,
+  `rr10`, `bf10`; the butterflies are **market strangles**, so each wing's smile vols are recovered
+  by the price-matching root-find (Reiswich & Wystup). Delta<->strike uses configurable conventions
+  (`DeltaConvention`: spot/forward delta, premium adjustment, ATM = DNS / forward / spot). Each tenor
+  is then fitted with one **arbitrage-free SVI** slice (`fit_svi_surface`): joint least squares with
+  the Durrleman butterfly condition `g(k) >= 0` and non-crossing (calendar) constraints as penalties,
+  Roger Lee wing bound `b(1+|rho|) <= 2`. The SVI form is smooth and defined for all `k` -- the wings
+  are its own asymptotically-linear continuation -- and every derivative Dupire needs is **analytic**
+  (Gatheral total-variance form), so there is no spline, no finite-difference Dupire, and no separate
+  wing rule. `FXVolSurface.svi_report` carries the fit error and residual arbitrage.
+- **Model side**. Free variables: per tenor the SVI level/skew-scale `(a, b)`, with the shape
+  `(rho, m, sigma)` frozen from the market fit -- so a candidate slice is linear in the free
+  variables and needs no inner fit. Regime `i` is the base slice with total variance scaled by
+  `(1 +- spread)^2`. Each regime slice -> its analytic Dupire surface -> the model's own implied-vol
+  surface via the **forward regime-switching PDE** (`vanilla.py`).
+- **The fit** (`target="hybrid"`, default) optimises against a smooth mixture surrogate and
+  re-anchors it `n_pde_passes` times with the forward-PDE-minus-mixture correction -- fast, robust,
+  converges to a PDE-accurate fit (~0.6 bp RMS on a 10-tenor surface in ~17 s). `target="pde"`
+  optimises the PDE directly (literal but noise-sensitive near the optimum -- `hybrid` is
+  preferred); `target="mixture"` is the surrogate alone (~few bp, ~1 s). Tenors below ~2 weeks use
+  the mixture (exact there; the PDE cannot resolve a near-degenerate density).
 
 The result is a `CalibratedRegimeModel` -- three **time-dependent** Dupire regimes plus the
-generator -- which plugs straight into `ThreeRegimePricer` (the pricer rebuilds its operators per
-segment when `model.time_varying`). Vega on a calibrated model is a parallel shift of the whole
-local-vol surface.
+generator -- and `ThreeRegimePricer` rebuilds its FD operators per segment when `model.time_varying`.
+Vega on a calibrated model is a parallel shift of the whole local-vol surface.
 
-Stage 2, `calibrate_switch_rate_to_term_structure`, fits the scalar rate of
-`Q = rate (1 pi^T - I)` so the model's ATM forward-variance term structure matches the market ATM
-curve -- the switching-speed information static smiles cannot pin down. Needs `pi0 != stationary`.
+**Stage 2** fits the scalar switch rate of `Q = rate (1 pi^T - I)` to the market **25d butterfly
+term structure** -- the smile-flattening-with-maturity that switching controls in a level-dispersion
+regime model. It is only weakly identified by vanillas: the fit is bounded, `pi0` defaults to the
+slope of the ATM term structure, and it falls back to a persistence prior (regimes ~6 months) when
+the butterfly term structure barely responds -- `report.switch_rate_identified` says which happened.
+Set `calibrate_q=False`, or pass `q=`, to override.
 
-Front Arena entry points: `fx_surface_from_quotes` (quote arrays + `FIrCurveInformation` objects),
-`market_surface_from_front_arena` (queries a delta-parametrised vol object at +-10d/+-25d/ATM), and
-`calibrated_tarf_model_from_surface` (calibrate + price in one call, returns the fit report
-alongside `result`). Worked example: `examples/calibrate_usdchf_surface.py`.
+Front Arena entry points: `market_surface_from_front_arena` (queries a delta-parametrised vol object
+at +-10d/+-25d/ATM -- expects a full surface), `fx_surface_from_quotes` (quote arrays +
+`FIrCurveInformation` objects), and `calibrated_tarf_model_from_surface` (calibrate + price in one
+call; `result` plus the fit report). Worked example: `examples/calibrate_usdchf_surface.py`.
 
-Known limitations: the interpolated surface is not guaranteed arbitrage-free (a smoother SVI/SSVI
-slice with analytic Dupire is the natural upgrade); the 10d wings rest on the surface's own
-extrapolation beyond the outermost quote; Dupire derivatives are finite-difference. All are
-documented at their call sites.
+Remaining limitations: SVI slices are fitted independently in the calibration loop (frozen shape),
+so a joint calendar guarantee holds only up to the small `report.max_calendar_violation` (checked on
++-90% log-moneyness, well past any traded strike); the frozen SVI shape means the deep 10d wings can
+carry ~1-2 bp of fit error; the switch rate is weakly identified (above). SSVI with a globally
+coupled term structure is the next refinement.
 
 ## Tests
 
@@ -149,8 +162,9 @@ documented at their call sites.
 - `test_front_arena_interface.py` -- ACM boundary and serialization adapter checks.
 - `test_seasoned_tarf.py` -- past fixings dropped, valuation-date fixing priced in, grid-resolution
   passthrough on the `front_arena` wrappers.
-- `test_surface_calibration.py` -- market-strangle reconstruction, Dupire, the forward vanilla PDE
-  (Black-Scholes limit + mixture smile), and the two-stage full-surface fit.
+- `test_surface_calibration.py` -- market-strangle reconstruction, arbitrage-free SVI (butterfly /
+  calendar), analytic Dupire, the forward vanilla PDE (Black-Scholes limit + mixture smile), and the
+  two-stage full-surface fit.
 
 ## Front Arena AEF interface
 

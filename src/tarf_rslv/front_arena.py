@@ -13,7 +13,7 @@ from datetime import date, timedelta
 
 import numpy as np
 
-from .calibration_surface import calibrate_regime_surface
+from .calibration_surface import calibrate_regime_model
 from .model import RegimeSwitchingLocalVolModel, SingleRegimeLocalVolModel
 from .product import TARFAccumulator
 from .solver import ThreeRegimePricer
@@ -472,15 +472,17 @@ def calibrated_tarf_model_from_surface(
     num_spot: int = 161,
     num_target: int = 100,
     n_steps: int = 120,
+    calibrate_q: bool = True,
     calibration_kwargs: dict | None = None,
 ) -> dict[str, object]:
-    """Calibrate the three-regime model to ``surface`` (full smile, Dupire local vol) and price the
-    TARF with it. ``result`` holds the DenominatedValue; ``calibration`` the fit report.
+    """Calibrate the full three-regime model to ``surface`` (arbitrage-free SVI smile, analytic
+    Dupire local vol, forward regime-switching PDE, plus the switch rate) and price the TARF with it.
+    ``result`` holds the DenominatedValue; ``calibration`` the fit report.
     """
     weights = np.asarray(regime_weights, dtype=float)
     q = None if q_matrix is None else np.asarray(q_matrix, dtype=float)
-    model, report = calibrate_regime_surface(
-        surface, weights, q, spread=regime_spread, **(calibration_kwargs or {})
+    model, report = calibrate_regime_model(
+        surface, weights, q=q, spread=regime_spread, calibrate_q=calibrate_q, **(calibration_kwargs or {})
     )
 
     tarf = TARFAccumulator(
@@ -505,6 +507,10 @@ def calibrated_tarf_model_from_surface(
         "calibration": {
             "rms_vol_error": report.rms_vol_error,
             "max_vol_error": report.max_vol_error,
+            "svi_rms_vol_error": surface.svi_report.rms_vol_error if surface.svi_report else None,
+            "max_butterfly_violation": report.max_butterfly_violation,
+            "max_calendar_violation": report.max_calendar_violation,
+            "switch_rate": report.switch_rate,
             "success": report.success,
         },
     }

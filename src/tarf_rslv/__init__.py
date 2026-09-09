@@ -23,6 +23,7 @@ from .calibration_surface import (
     CalibratedRegimeModel,
     SharedSmileParams,
     SurfaceCalibrationReport,
+    calibrate_regime_model,
     calibrate_regime_surface,
     calibrate_switch_rate_to_term_structure,
 )
@@ -60,6 +61,7 @@ __all__ = [
     "FXVolSurface",
     "DeltaConvention",
     "RegimeForwardPDE",
+    "calibrate_regime_model",
     "calibrate_regime_surface",
     "calibrate_switch_rate_to_term_structure",
     "CalibratedRegimeModel",

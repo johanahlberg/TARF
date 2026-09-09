@@ -26,9 +26,10 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 import numpy as np
-from scipy.interpolate import CubicSpline
 from scipy.optimize import brentq
 from scipy.stats import norm
+
+from .svi import SVIFitReport, SVISlice, fit_svi_surface, svi_local_vol, svi_total_variance_and_derivs
 
 SQRT_EPS = 1e-12
 
@@ -236,35 +237,17 @@ class SmileQuotes:
 
 
 # --------------------------------------------------------------------------------------------------
-# Full surface
+# Full surface (arbitrage-free SVI per slice, analytic Dupire)
 # --------------------------------------------------------------------------------------------------
-def _smile_interpolator(x: np.ndarray, y: np.ndarray) -> Callable[[np.ndarray], np.ndarray]:
-    """Natural cubic spline on ``[x0, x_n]``, continued **linearly** (constant slope, taken at the
-    boundary knot) outside it. Linear wings keep the first derivative continuous, which the Dupire
-    formula needs -- a flat clamp would put a kink in ``w_y`` right at the 10-delta knot.
-    """
-    spline = CubicSpline(x, y, bc_type="natural")
-    lo, hi = float(x[0]), float(x[-1])
-    slope_lo = float(spline(lo, 1))
-    slope_hi = float(spline(hi, 1))
-    y_lo, y_hi = float(y[0]), float(y[-1])
-
-    def evaluate(query: np.ndarray) -> np.ndarray:
-        q = np.asarray(query, dtype=float)
-        out = spline(np.clip(q, lo, hi))
-        out = np.where(q < lo, y_lo + slope_lo * (q - lo), out)
-        out = np.where(q > hi, y_hi + slope_hi * (q - hi), out)
-        return out
-
-    return evaluate
-
-
 @dataclass
 class FXVolSurface:
-    """A term structure of :class:`SmileQuotes`, with implied- and local-vol evaluation.
+    """A term structure of :class:`SmileQuotes`, fitted with one arbitrage-free SVI slice per tenor.
 
     ``domestic_zero`` / ``foreign_zero`` are callables ``t -> continuously-compounded Act/365
     zero rate``. The surface pins ``spot`` and derives every forward as ``spot * exp((r_d - r_f) t)``.
+    Log-moneyness ``y = ln(K / F_t)``; total variance is linear in ``t`` between slices and grows
+    linearly (constant forward vol) outside the quoted range. ``svi_report`` carries the fit error
+    and the residual butterfly / calendar arbitrage.
     """
 
     spot: float
@@ -275,6 +258,9 @@ class FXVolSurface:
     vol_floor: float = 1e-3
     vol_cap: float = 5.0
 
+    svi_slices: list[SVISlice] = field(default_factory=list, init=False)
+    svi_report: SVIFitReport | None = field(default=None, init=False)
+
     def __post_init__(self) -> None:
         self.smiles = sorted(self.smiles, key=lambda s: s.tenor)
         self._tenors = np.array([s.tenor for s in self.smiles], dtype=float)
@@ -283,17 +269,17 @@ class FXVolSurface:
         if len(np.unique(self._tenors)) != len(self._tenors):
             raise ValueError("duplicate tenor in the surface")
 
-        # Per-tenor smile as sigma(log-moneyness y = ln(K / F_t)).
-        self._smile_of_y: list[Callable[[np.ndarray], np.ndarray]] = []
         self._knot_y: list[np.ndarray] = []
+        knot_iv: list[np.ndarray] = []
         for smile in self.smiles:
             fwd = self.forward(smile.tenor)
             strikes, vols = smile.knots(
                 self.spot, fwd, self.foreign_df(smile.tenor), self.domestic_df(smile.tenor), self.convention
             )
-            y = np.log(strikes / fwd)
-            self._knot_y.append(y)
-            self._smile_of_y.append(_smile_interpolator(y, vols))
+            self._knot_y.append(np.log(strikes / fwd))
+            knot_iv.append(np.asarray(vols, dtype=float))
+
+        self.svi_slices, self.svi_report = fit_svi_surface(self._tenors, self._knot_y, knot_iv)
 
     # -- curves --------------------------------------------------------------------------------
     def domestic_df(self, t: float) -> float:
@@ -306,55 +292,32 @@ class FXVolSurface:
         return self.spot * self.foreign_df(t) / self.domestic_df(t)
 
     # -- implied vol / total variance --------------------------------------------------------
-    def implied_vol(self, t: float, y: np.ndarray | float) -> np.ndarray:
-        """Implied volatility at maturity ``t`` and log-moneyness ``y = ln(K / F_t)``.
-
-        Cubic in ``y`` per tenor (flat wings), linear in **total variance** across tenors, and a
-        constant-vol extension before the first / after the last tenor.
-        """
-        y_arr = np.atleast_1d(np.asarray(y, dtype=float))
-        tenors = self._tenors
-
-        if t <= tenors[0]:
-            return np.clip(self._smile_of_y[0](y_arr), self.vol_floor, self.vol_cap)
-        if t >= tenors[-1]:
-            return np.clip(self._smile_of_y[-1](y_arr), self.vol_floor, self.vol_cap)
-
-        hi = int(np.searchsorted(tenors, t))
-        lo = hi - 1
-        t_lo, t_hi = tenors[lo], tenors[hi]
-        w_lo = self._smile_of_y[lo](y_arr) ** 2 * t_lo
-        w_hi = self._smile_of_y[hi](y_arr) ** 2 * t_hi
-        frac = (t - t_lo) / (t_hi - t_lo)
-        w = (1.0 - frac) * w_lo + frac * w_hi
-        return np.clip(np.sqrt(np.maximum(w, 0.0) / t), self.vol_floor, self.vol_cap)
-
     def total_variance(self, t: float, y: np.ndarray | float) -> np.ndarray:
-        return self.implied_vol(t, y) ** 2 * t
+        w, _, _, _ = svi_total_variance_and_derivs(self.svi_slices, max(float(t), 1e-8), y)
+        return np.maximum(w, 1e-12)
+
+    def implied_vol(self, t: float, y: np.ndarray | float) -> np.ndarray:
+        """Implied volatility at maturity ``t`` and log-moneyness ``y = ln(K / F_t)``."""
+        return np.clip(np.sqrt(self.total_variance(t, y) / max(float(t), 1e-8)), self.vol_floor, self.vol_cap)
 
     def market_nodes(self) -> list[tuple[float, float, float, float]]:
-        """``(tenor, y, implied_vol, vega_weight)`` for every quoted (tenor, delta) point."""
+        """``(tenor, y, implied_vol, vega_weight)`` for every quoted (tenor, delta) point (SVI values,
+        which reproduce the quotes to ``svi_report.rms_vol_error``)."""
         nodes: list[tuple[float, float, float, float]] = []
-        for smile, y_knots, smile_fn in zip(self.smiles, self._knot_y, self._smile_of_y):
-            fwd = self.forward(smile.tenor)
-            vols = smile_fn(y_knots)
+        for slc, y_knots in zip(self.svi_slices, self._knot_y):
+            fwd = self.forward(slc.tenor)
+            vols = np.asarray(slc.implied_vol(y_knots), dtype=float)
             for y_val, vol in zip(y_knots, vols):
-                strike = fwd * np.exp(y_val)
-                vega = bs_forward_vega(fwd, strike, float(vol), smile.tenor)
-                nodes.append((smile.tenor, float(y_val), float(vol), max(vega, 1e-6)))
+                vega = bs_forward_vega(fwd, fwd * np.exp(y_val), float(vol), slc.tenor)
+                nodes.append((slc.tenor, float(y_val), float(vol), max(vega, 1e-6)))
         return nodes
 
-    # -- Dupire local volatility -----------------------------------------------------------
+    # -- Dupire local volatility ----------------------------------------------------------
     def local_vol(self, t: float, spot_level: np.ndarray | float) -> np.ndarray:
-        """Dupire local volatility ``sigma_loc(S, t)`` from this implied surface.
-
-        Uses the Gatheral total-variance form in ``y = ln(S / F_t)``; derivatives by central
-        differences; the denominator and the result are floored to stay real and finite.
-        """
-        y = np.log(np.asarray(spot_level, dtype=float) / self.forward(t))
-        return local_vol_from_total_variance(
-            self.total_variance, t, y, vol_floor=self.vol_floor, vol_cap=self.vol_cap,
-        )
+        """Dupire local volatility ``sigma_loc(S, t)`` -- analytic from the SVI stack (Gatheral
+        total-variance form; ``k = ln(S / F_t)``)."""
+        k = np.log(np.asarray(spot_level, dtype=float) / self.forward(t))
+        return svi_local_vol(self.svi_slices, float(t), k, vol_floor=self.vol_floor, vol_cap=self.vol_cap)
 
 
 def local_vol_from_total_variance(

@@ -10,9 +10,11 @@ from tarf_rslv import (
     SmileQuotes,
     TARFAccumulator,
     ThreeRegimePricer,
+    calibrate_regime_model,
     calibrate_regime_surface,
     calibrate_switch_rate_to_term_structure,
 )
+from tarf_rslv.svi import SVISlice, fit_svi_surface
 from tarf_rslv.vol_surface import (
     DeltaConvention,
     bs_forward_price,
@@ -180,6 +182,61 @@ def test_calibrate_switch_rate_needs_pi0_to_differ_from_stationary():
         calibrate_switch_rate_to_term_structure(
             surface, [0.065, 0.072, 0.080], pi0=[0.25, 0.5, 0.25], stationary=[0.25, 0.5, 0.25]
         )
+
+
+# --------------------------------------------------------------------------------------------------
+# SVI
+# --------------------------------------------------------------------------------------------------
+def test_svi_fit_is_accurate_and_arbitrage_free():
+    surface = _skew_surface()
+    k = list(surface._knot_y)
+    iv = [np.asarray(s.implied_vol(kk)) for s, kk in zip(surface.svi_slices, k)]
+    slices, report = fit_svi_surface(surface._tenors, k, iv)
+
+    assert report.rms_vol_error < 5e-4
+    assert report.max_butterfly_violation < 1e-6      # Durrleman g >= 0 everywhere
+    assert report.max_calendar_violation < 1e-6       # slices do not cross
+
+
+def test_svi_slice_scaled_matches_variance_multiplier():
+    s = SVISlice(0.5, 0.004, 0.2, -0.3, 0.0, 0.1)
+    s2 = s.scaled(1.1)
+    k = np.linspace(-0.2, 0.2, 9)
+    assert np.allclose(s2.total_variance(k), 1.1 * s.total_variance(k))
+
+
+def test_fxvolsurface_is_svi_backed_and_arbitrage_free():
+    surface = _skew_surface()
+    assert surface.svi_report is not None
+    assert surface.svi_report.max_butterfly_violation < 1e-6
+    assert surface.svi_report.max_calendar_violation < 1e-6
+    # analytic Dupire is finite and positive across a wide moneyness range
+    lv = surface.local_vol(0.5, surface.forward(0.5) * np.exp(np.linspace(-0.25, 0.25, 21)))
+    assert np.all(np.isfinite(lv)) and np.all(lv > 0.0)
+
+
+# --------------------------------------------------------------------------------------------------
+# full two-stage calibration
+# --------------------------------------------------------------------------------------------------
+def test_calibrate_regime_model_full_pipeline():
+    surface = _skew_surface()
+    model, report = calibrate_regime_model(
+        surface, [0.25, 0.5, 0.25], spread=0.03, target="hybrid", n_pde_passes=2,
+        num_x=401, steps_per_year=300, dupire_nt=21, dupire_nx=101,
+    )
+    assert report.rms_vol_error < 8e-4
+    assert report.max_butterfly_violation < 1e-3
+    assert report.max_calendar_violation < 5e-3
+    assert report.switch_rate > 0.0
+    assert model.time_varying
+    assert np.allclose(model.q.sum(axis=1), 0.0, atol=1e-12)
+
+    tarf = TARFAccumulator(
+        target_level=0.10, strike=0.82, fixing_dates=tuple((k + 1) / 12 for k in range(12)),
+        is_call_option=False, notional1=1.0, notional2=2.0, target_adjustment=0,
+    )
+    price = ThreeRegimePricer(model, model.regime_weights, num_spot=121, num_target=60, n_steps=80).price_tarf(tarf, 1.0)
+    assert np.isfinite(price)
 
 
 # --------------------------------------------------------------------------------------------------
