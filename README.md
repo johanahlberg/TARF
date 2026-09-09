@@ -16,7 +16,12 @@ three-regime layer is an operator-split extension of the same scheme.
   (0 full gain / 2 part gain / 3 no gain) plus the ESL strike-adjusted variant (1).
 - `src/tarf_rslv/solver.py`: `SingleRegimePricer` and `ThreeRegimePricer` -- the finite-difference
   engine (see *Numerical scheme* below) and on-grid Greeks.
-- `src/tarf_rslv/calibration.py`: the two calibration stages (see *Calibration* below).
+- `src/tarf_rslv/calibration.py`: the compact two-stage calibration (single tenor; see *Calibration*).
+- `src/tarf_rslv/vol_surface.py`: FX surface layer -- broker quotes (ATM, 25d/10d RR/BF, market
+  strangles) to a 5-point smile per tenor, delta/strike conventions, implied- and Dupire local-vol.
+- `src/tarf_rslv/vanilla.py`: `RegimeForwardPDE` -- the model's own implied-vol surface from a forward
+  Fokker-Planck solve for the joint (log-spot, regime) density. The calibration target.
+- `src/tarf_rslv/calibration_surface.py`: full-surface calibration (see *Full vol-surface calibration*).
 - `src/tarf_rslv/front_arena.py`: AEF-compatible, state-free valuation wrapper and ADFL example.
 
 ## Numerical scheme
@@ -90,6 +95,48 @@ Both are verified by synthetic round-trip recovery in `test_calibration_stage.py
 helpers `calibrate_regime_smile` (single quadratic smile) and `fit_switching_matrix` (P -> Q = P - I)
 are lightweight and used by the interface tests.
 
+## Full vol-surface calibration
+
+`calibration_surface.calibrate_regime_surface` fits the three-regime model to a **whole FX vol
+surface** -- every tenor, and five strikes per tenor (10d put, 25d put, ATM, 25d call, 10d call).
+
+- **Market side** (`vol_surface.py`). Broker quotes per tenor are `atm`, `rr25`, `bf25`, `rr10`,
+  `bf10`; the butterflies are **market strangles**, so each wing's smile vols are recovered by the
+  price-matching root-find (Reiswich & Wystup). Delta<->strike uses configurable conventions
+  (`DeltaConvention`: spot/forward delta, premium adjustment, ATM = DNS / forward / spot). The
+  surface interpolates cubically in log-moneyness (linear wings) and linearly in total variance
+  across tenors, and yields a **Dupire local-vol** surface (Gatheral total-variance form).
+- **Model side**. A shared base implied smile per tenor (five numbers = the five quotes) plus one
+  regime vol-dispersion `spread`; the three regimes are the base smile scaled by
+  `(1 - spread, 1, 1 + spread)`. Each regime's implied smile -> its Dupire local-vol surface ->
+  the model's own implied-vol surface via the **forward regime-switching PDE** (`vanilla.py`).
+- **The fit** drives the model surface onto the market surface by least squares over the shared-smile
+  parameters. `target="hybrid"` (default) optimises against a smooth mixture surrogate and
+  re-anchors it `n_pde_passes` times with the forward-PDE-minus-mixture correction -- fast and
+  robust, and converges to a PDE-accurate fit (~0.3 bp RMS on a 10-tenor surface in ~20 s).
+  `target="pde"` optimises the PDE directly (literal, slower, noise-sensitive); `target="mixture"`
+  is the surrogate alone (~5 bp, ~1 s). Tenors below ~2 weeks use the mixture (exact there; the PDE
+  cannot resolve a near-degenerate density).
+
+The result is a `CalibratedRegimeModel` -- three **time-dependent** Dupire regimes plus the
+generator -- which plugs straight into `ThreeRegimePricer` (the pricer rebuilds its operators per
+segment when `model.time_varying`). Vega on a calibrated model is a parallel shift of the whole
+local-vol surface.
+
+Stage 2, `calibrate_switch_rate_to_term_structure`, fits the scalar rate of
+`Q = rate (1 pi^T - I)` so the model's ATM forward-variance term structure matches the market ATM
+curve -- the switching-speed information static smiles cannot pin down. Needs `pi0 != stationary`.
+
+Front Arena entry points: `fx_surface_from_quotes` (quote arrays + `FIrCurveInformation` objects),
+`market_surface_from_front_arena` (queries a delta-parametrised vol object at +-10d/+-25d/ATM), and
+`calibrated_tarf_model_from_surface` (calibrate + price in one call, returns the fit report
+alongside `result`). Worked example: `examples/calibrate_usdchf_surface.py`.
+
+Known limitations: the interpolated surface is not guaranteed arbitrage-free (a smoother SVI/SSVI
+slice with analytic Dupire is the natural upgrade); the 10d wings rest on the surface's own
+extrapolation beyond the outermost quote; Dupire derivatives are finite-difference. All are
+documented at their call sites.
+
 ## Tests
 
 - `test_paper_benchmark.py` -- **correctness gate**: reproduces Luo & Shevchenko Table 1 (all three
@@ -102,6 +149,8 @@ are lightweight and used by the interface tests.
 - `test_front_arena_interface.py` -- ACM boundary and serialization adapter checks.
 - `test_seasoned_tarf.py` -- past fixings dropped, valuation-date fixing priced in, grid-resolution
   passthrough on the `front_arena` wrappers.
+- `test_surface_calibration.py` -- market-strangle reconstruction, Dupire, the forward vanilla PDE
+  (Black-Scholes limit + mixture smile), and the two-stage full-surface fit.
 
 ## Front Arena AEF interface
 
@@ -114,8 +163,10 @@ is the single boundary function that touches them. ADFL templates are in `front_
 and `front_arena.ADFL_EXAMPLE_MARKET_DATA`.
 
 Worked examples with mock FA market-data objects are in `examples/` -- `price_usdchf_tarf.py`
-(a fresh USDCHF seller TARF) and `price_seasoned_tarf.py` (the same deal valued mid-life), each with
-a flat-vol Monte-Carlo cross-check. Run e.g. `python examples/price_seasoned_tarf.py`.
+(a fresh USDCHF seller TARF), `price_seasoned_tarf.py` (the same deal valued mid-life), each with
+a flat-vol Monte-Carlo cross-check, and `calibrate_usdchf_surface.py` (calibrate the 3-regime model
+to a full 10-tenor USDCHF surface, then price the seasoned TARF with it). Run e.g.
+`python examples/calibrate_usdchf_surface.py`.
 
 ## Run tests
 

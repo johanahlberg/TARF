@@ -300,8 +300,13 @@ class SingleRegimePricer:
 
         s_grid, a_grid = self._grids(tarf, maturity)
         x_grid = np.log(s_grid)
-        sigma_nodes = self.model.local_volatility(s_grid)
-        operator = _LogVolOperator(x_grid, sigma_nodes, self.model.rate, self.model.dividend_yield)
+        time_varying = bool(getattr(self.model, "time_varying", False))
+
+        def operator_at(t_mid: float) -> _LogVolOperator:
+            sigma_nodes = self.model.local_volatility(s_grid, t_mid) if time_varying else self.model.local_volatility(s_grid)
+            return _LogVolOperator(x_grid, sigma_nodes, self.model.rate, self.model.dividend_yield)
+
+        operator = None if time_varying else operator_at(0.0)
 
         schedule = _tarf_fixing_schedule(tarf, maturity)
         fixing_at = {round(d, 12): k for k, d in schedule}
@@ -318,7 +323,8 @@ class SingleRegimePricer:
         for seg in range(len(events) - 2, -1, -1):
             t_hi, t_lo = float(events[seg + 1]), float(events[seg])
             n_sub = _segment_steps(t_hi - t_lo, maturity, self.n_steps)
-            values = _march_segment(operator, values, t_hi, t_lo, n_sub)
+            seg_operator = operator_at(0.5 * (t_hi + t_lo)) if time_varying else operator
+            values = _march_segment(seg_operator, values, t_hi, t_lo, n_sub)
 
             key = round(t_lo, 12)
             if key in fixing_at and fixing_at[key] not in applied:
@@ -430,10 +436,20 @@ class ThreeRegimePricer:
         s_grid, a_grid = reference._grids(tarf, maturity)
         x_grid = np.log(s_grid)
 
-        operators = [
-            _LogVolOperator(x_grid, regime.local_volatility(s_grid), regime.rate, regime.dividend_yield)
-            for regime in self.model.regimes
-        ]
+        time_varying = bool(getattr(self.model, "time_varying", False))
+
+        def operators_at(t_mid: float) -> list:
+            return [
+                _LogVolOperator(
+                    x_grid,
+                    regime.local_volatility(s_grid, t_mid) if time_varying else regime.local_volatility(s_grid),
+                    regime.rate,
+                    regime.dividend_yield,
+                )
+                for regime in self.model.regimes
+            ]
+
+        operators = None if time_varying else operators_at(0.0)
         q = np.asarray(self.model.q if self.model.q is not None else np.zeros((3, 3)), dtype=float)
         if q.shape != (3, 3):
             raise ValueError("Generator matrix must be 3x3")
@@ -455,7 +471,8 @@ class ThreeRegimePricer:
         for seg in range(len(events) - 2, -1, -1):
             t_hi, t_lo = float(events[seg + 1]), float(events[seg])
             n_sub = _segment_steps(t_hi - t_lo, maturity, self.n_steps)
-            values = _march_segment(operators, values, t_hi, t_lo, n_sub, couple=couple)
+            seg_operators = operators_at(0.5 * (t_hi + t_lo)) if time_varying else operators
+            values = _march_segment(seg_operators, values, t_hi, t_lo, n_sub, couple=couple)
 
             key = round(t_lo, 12)
             if key in fixing_at and fixing_at[key] not in applied:
@@ -530,6 +547,20 @@ class ThreeRegimePricer:
         price = float(curve[1])
         v_x = (curve[2] - curve[0]) / (2.0 * dx)
         v_xx = (curve[2] - 2.0 * curve[1] + curve[0]) / (dx * dx)
+
+        if getattr(self.model, "time_varying", False):
+            # A calibrated (Dupire) model bumps its whole local-vol surface by a parallel shift.
+            bumped_price = ThreeRegimePricer(
+                self.model.bumped_vol(vega_bump), self.regime_weights, self.num_spot, self.num_target, self.n_steps
+            ).price_tarf(tarf, maturity)
+            total_vega = (bumped_price - price) / vega_bump * 0.01
+            return {
+                "price": price,
+                "delta": float(v_x / s0),
+                "gamma": float((v_xx - v_x) / (s0 * s0)),
+                "vega": float(total_vega),
+                "regime_vega": [float(total_vega)],
+            }
 
         regime_vega: list[float] = []
         for r, regime in enumerate(self.model.regimes):

@@ -9,13 +9,15 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 
 import numpy as np
 
+from .calibration_surface import calibrate_regime_surface
 from .model import RegimeSwitchingLocalVolModel, SingleRegimeLocalVolModel
 from .product import TARFAccumulator
 from .solver import ThreeRegimePricer
+from .vol_surface import DeltaConvention, FXVolSurface, SmileQuotes
 
 
 @dataclass(frozen=True)
@@ -345,6 +347,167 @@ def tarf_model_from_market_data(
         n_steps=n_steps,
     )
     return {"result": _make_denominated_value(value, _denominated_unit(strike_value, "strike_value"), valuation_date)}
+
+
+def _zero_rate_fn(curve: object, valuation_date: date, name: str):
+    """Wrap an FA ``FIrCurveInformation`` as ``t -> continuous Act/365 zero rate``."""
+    rate = getattr(curve, "Rate", None)
+    if not callable(rate):
+        raise TypeError(f"{name} must provide a Rate(startDay, endDay) method")
+
+    def zero(t: float) -> float:
+        end = valuation_date + timedelta(days=max(int(round(float(t) * 365.0)), 1))
+        return float(rate(valuation_date, end))
+
+    return zero
+
+
+def fx_surface_from_quotes(
+    spot: float,
+    valuation_date: date,
+    tenor_years: Sequence[float],
+    atm: Sequence[float],
+    rr25: Sequence[float],
+    bf25: Sequence[float],
+    rr10: Sequence[float],
+    bf10: Sequence[float],
+    domestic_curve: object,
+    foreign_curve: object,
+    *,
+    bf_convention: str = "market_strangle",
+    delta_type: str = "spot",
+    premium_adjusted: bool = False,
+    atm_convention: str = "dns",
+) -> FXVolSurface:
+    """Build an :class:`FXVolSurface` from quote arrays (ATM / 25d & 10d RR & BF per tenor) and two
+    FA ``FIrCurveInformation`` objects.
+
+    ``bf_convention="market_strangle"`` for broker quotes (default), ``"smile"`` if the butterflies
+    are already smile-vol butterflies. Set the delta / ATM conventions to match your quote source
+    (for USDCHF the premium is CHF, so ``premium_adjusted=False``).
+    """
+    smiles = [
+        SmileQuotes(float(t), float(a), float(r25), float(b25), float(r10), float(b10), bf_convention)
+        for t, a, r25, b25, r10, b10 in zip(tenor_years, atm, rr25, bf25, rr10, bf10)
+    ]
+    return FXVolSurface(
+        spot=float(spot),
+        smiles=smiles,
+        domestic_zero=_zero_rate_fn(domestic_curve, valuation_date, "domestic_curve"),
+        foreign_zero=_zero_rate_fn(foreign_curve, valuation_date, "foreign_curve"),
+        convention=DeltaConvention(delta_type, premium_adjusted, atm_convention),
+    )
+
+
+def market_surface_from_front_arena(
+    spot: float,
+    valuation_date: date,
+    maturity_dates: Sequence[date],
+    domestic_curve: object,
+    foreign_curve: object,
+    vol_surface: object,
+    *,
+    bf_convention: str = "smile",
+    delta_type: str = "spot",
+    premium_adjusted: bool = False,
+    atm_convention: str = "dns",
+) -> FXVolSurface:
+    """Query a delta-parametrised FA vol object (``Value(expiry, delta, fRate, dRate)``) at
+    +-10d / +-25d / ATM for each expiry and assemble an :class:`FXVolSurface`.
+
+    A pure ``FMalzParametricVolatilityInformation`` carries only 25d information, so its 10d values
+    are the parabola's own extrapolation -- pass genuine 10d quotes through ``fx_surface_from_quotes``
+    when you have them.
+    """
+    value = getattr(vol_surface, "Value", None)
+    if not callable(value):
+        raise TypeError("vol_surface must provide a Value(expiryDate, delta, foreignRate, domesticRate) method")
+    dom_zero = _zero_rate_fn(domestic_curve, valuation_date, "domestic_curve")
+    for_zero = _zero_rate_fn(foreign_curve, valuation_date, "foreign_curve")
+
+    tenors, atm, rr25, bf25, rr10, bf10 = [], [], [], [], [], []
+    for md in maturity_dates:
+        t = (md - valuation_date).days / 365.0
+        if t <= 0.0:
+            raise ValueError("every maturity_date must be after valuation_date")
+        r_d, r_f = dom_zero(t), for_zero(t)
+        v_atm = float(value(md, 0.50, r_f, r_d))
+        v_25c = float(value(md, 0.25, r_f, r_d))
+        v_25p = float(value(md, -0.25, r_f, r_d))
+        v_10c = float(value(md, 0.10, r_f, r_d))
+        v_10p = float(value(md, -0.10, r_f, r_d))
+        tenors.append(t)
+        atm.append(v_atm)
+        rr25.append(v_25c - v_25p)
+        bf25.append(0.5 * (v_25c + v_25p) - v_atm)
+        rr10.append(v_10c - v_10p)
+        bf10.append(0.5 * (v_10c + v_10p) - v_atm)
+
+    return fx_surface_from_quotes(
+        spot, valuation_date, tenors, atm, rr25, bf25, rr10, bf10, domestic_curve, foreign_curve,
+        bf_convention=bf_convention, delta_type=delta_type,
+        premium_adjusted=premium_adjusted, atm_convention=atm_convention,
+    )
+
+
+def calibrated_tarf_model_from_surface(
+    valuation_date: date,
+    spot_value: object,
+    strike_value: object,
+    target_level: float,
+    fixing_times: Sequence[float],
+    maturity: float,
+    surface: FXVolSurface,
+    *,
+    regime_weights: Sequence[float] = (0.25, 0.5, 0.25),
+    q_matrix: Sequence[Sequence[float]] | None = None,
+    regime_spread: float = 0.03,
+    is_call_option: bool = True,
+    notional1: Sequence[float] | float = 1.0,
+    notional2: Sequence[float] | float = 1.0,
+    barrier: float = 0.0,
+    target_adjustment: int = 0,
+    inverted_target: bool = False,
+    accumulated_value: float = 0.0,
+    num_spot: int = 161,
+    num_target: int = 100,
+    n_steps: int = 120,
+    calibration_kwargs: dict | None = None,
+) -> dict[str, object]:
+    """Calibrate the three-regime model to ``surface`` (full smile, Dupire local vol) and price the
+    TARF with it. ``result`` holds the DenominatedValue; ``calibration`` the fit report.
+    """
+    weights = np.asarray(regime_weights, dtype=float)
+    q = None if q_matrix is None else np.asarray(q_matrix, dtype=float)
+    model, report = calibrate_regime_surface(
+        surface, weights, q, spread=regime_spread, **(calibration_kwargs or {})
+    )
+
+    tarf = TARFAccumulator(
+        target_level=float(target_level),
+        strike=_denominated_number(strike_value, "strike_value"),
+        fixing_dates=tuple(float(time) for time in fixing_times),
+        is_call_option=bool(is_call_option),
+        notional1=notional1,
+        notional2=notional2,
+        barrier=float(barrier),
+        target_adjustment=int(target_adjustment),
+        inverted_target=bool(inverted_target),
+        accumulated_value=float(accumulated_value),
+    )
+    price = ThreeRegimePricer(
+        model, model.regime_weights, num_spot=num_spot, num_target=num_target, n_steps=n_steps
+    ).price_tarf(tarf, float(maturity))
+
+    unit = _denominated_unit(strike_value, "strike_value")
+    return {
+        "result": _make_denominated_value(price, unit, valuation_date),
+        "calibration": {
+            "rms_vol_error": report.rms_vol_error,
+            "max_vol_error": report.max_vol_error,
+            "success": report.success,
+        },
+    }
 
 
 ADFL_EXAMPLE = """\
