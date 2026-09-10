@@ -27,6 +27,7 @@ from .calibration_surface import (
     calibrate_regime_surface,
     calibrate_switch_rate_to_term_structure,
 )
+from .barriers import OneTouchQuote, RegimeBarrierPricer
 from .greeks import compute_local_greeks
 from .model import RegimeSwitchingLocalVolModel, SingleRegimeLocalVolModel, build_default_regime_matrix
 from .product import FixingOutcome, TARFAccumulator
@@ -70,4 +71,6 @@ __all__ = [
     "fx_surface_from_quotes",
     "market_surface_from_front_arena",
     "calibrated_tarf_model_from_surface",
+    "RegimeBarrierPricer",
+    "OneTouchQuote",
 ]

@@ -459,11 +459,12 @@ def calibrated_tarf_model_from_surface(
     maturity: float,
     surface: FXVolSurface,
     *,
-    n_regimes: int = 3,
+    n_regimes: int = 1,
     regime_weights: Sequence[float] = (0.25, 0.5, 0.25),
     q_matrix: Sequence[Sequence[float]] | None = None,
     regime_level_spread: float = 0.18,
     regime_skew_spread: float = 0.15,
+    barrier_quotes: list | None = None,
     is_call_option: bool = True,
     notional1: Sequence[float] | float = 1.0,
     notional2: Sequence[float] | float = 1.0,
@@ -480,14 +481,17 @@ def calibrated_tarf_model_from_surface(
     """Calibrate the local-vol model to ``surface`` (arbitrage-free SVI smile, analytic Dupire local
     vol) and price the TARF with it. ``n_regimes=1`` -- a single Dupire local-vol model
     (``SingleRegimePricer``, ~3x faster, no forward-smile dynamics); ``n_regimes=3`` -- the coupled
-    regime-switching model. ``result`` holds the DenominatedValue; ``calibration`` the fit report.
+    regime-switching model, whose structural parameters are set from ``regime_level_spread`` /
+    ``regime_skew_spread`` (a prior) unless ``barrier_quotes`` (a list of
+    ``tarf_rslv.OneTouchQuote``) are supplied, in which case they are calibrated to those.
+    ``result`` holds the DenominatedValue; ``calibration`` the fit report.
     """
     weights = np.asarray(regime_weights, dtype=float)
     q = None if q_matrix is None else np.asarray(q_matrix, dtype=float)
     model, report = calibrate_regime_model(
         surface, weights, n_regimes=int(n_regimes), q=q,
         level_spread=regime_level_spread, skew_spread=regime_skew_spread,
-        calibrate_q=calibrate_q, **(calibration_kwargs or {})
+        calibrate_q=calibrate_q, barrier_quotes=barrier_quotes, **(calibration_kwargs or {})
     )
 
     tarf = TARFAccumulator(
@@ -518,6 +522,8 @@ def calibrated_tarf_model_from_surface(
             "skew_spread": report.skew_spread,
             "switch_rate": report.switch_rate,
             "switch_rate_identified": report.switch_rate_identified,
+            "barrier_rms_price_error": report.barrier_rms_price_error,
+            "n_barrier_quotes": report.n_barrier_quotes,
             "success": report.success,
         },
     }

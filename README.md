@@ -22,7 +22,9 @@ three-regime layer is an operator-split extension of the same scheme.
 - `src/tarf_rslv/vol_surface.py`: FX surface layer -- broker quotes (ATM, 25d/10d RR/BF, market
   strangles) to a 5-point smile per tenor, delta/strike conventions, one SVI slice per tenor.
 - `src/tarf_rslv/vanilla.py`: `RegimeForwardPDE` -- the model's own implied-vol surface from a forward
-  Fokker-Planck solve for the joint (log-spot, regime) density. The calibration target.
+  Fokker-Planck solve for the joint (log-spot, regime) density. The vanilla calibration target.
+- `src/tarf_rslv/barriers.py`: `RegimeBarrierPricer` -- one-touch / no-touch / knock-out / knock-in
+  under the (1- or 3-) regime model; `OneTouchQuote`. The forward-smile calibration target.
 - `src/tarf_rslv/calibration_surface.py`: full-surface calibration (see *Full vol-surface calibration*).
 - `src/tarf_rslv/front_arena.py`: AEF-compatible, state-free valuation wrapper and ADFL example.
 
@@ -131,24 +133,26 @@ is kept only for comparison.
              rho   ->  rho - m_i * skew_spread
   ```
 
-  so the stressed regime is higher-vol *and* steeper-skew. `level_spread` / `skew_spread` are a
-  **regime interpretation, not calibrated** -- a static vanilla surface does not identify regime
-  dispersion (free it in the fit and it collapses to zero; forward-vol data would identify it).
-  Defaults `0.18 / 0.15` = calm / mid / stressed with the stressed vol ~1.4x and skew ~3x the calm
-  regime; override per your realised-vol regime study. Each regime slice -> its analytic Dupire
+  so the stressed regime is higher-vol *and* steeper-skew. Each regime slice -> its analytic Dupire
   surface -> the model's implied-vol surface via the **forward regime-switching PDE** (`vanilla.py`).
-- **The fit** frees per tenor only the SVI level / wing-scale `(a, b)` (shape frozen -- freeing
-  `sigma` too is ill-conditioned), driven by `target="hybrid"` (default): a smooth mixture surrogate
-  inside the optimiser, re-anchored `n_pde_passes` times by the forward-PDE correction (damped).
-  ~2 bp RMS / ~5 bp max on a 10-tenor surface in ~15 s -- the strong regime dispersion costs ~2 bp
-  of surface fit vs a pure Dupire model, mostly a systematic ~3-5 bp bias at the 10d wings (the
-  `(a, b)` freedom cannot re-shape the smile). `target="pde"` / `target="mixture"` are also
-  available. Tenors below ~2 weeks use the mixture (exact there).
-- **Stage 2** fits the scalar switch rate of `Q = rate (1 pi^T - I)` to the model's 25d **RR and BF
-  term structures** from the forward PDE (the mixture surrogate is switch-rate-blind when the regime
-  distribution starts stationary). It is only weakly identified (~a few bp of response over the
-  whole rate range): a coarse grid, falling back to a persistence prior (regimes ~6 months) when the
-  term structure does not respond -- `report.switch_rate_identified` says which.
+- **The vanilla fit** frees per tenor only the SVI level / wing-scale `(a, b)` (shape frozen --
+  freeing `sigma` too is ill-conditioned), driven by `target="hybrid"` (default): a smooth mixture
+  surrogate inside the optimiser, re-anchored `n_pde_passes` times by the forward-PDE correction
+  (damped). ~2 bp RMS / ~5 bp max on a 10-tenor surface in ~15 s -- the strong regime dispersion
+  costs ~2 bp vs a pure Dupire model, mostly a systematic ~3-5 bp bias at the 10d wings.
+  `target="pde"` / `target="mixture"` are also available. Tenors below ~2 weeks use the mixture.
+- **The regime structure** `{level_spread, skew_spread, switch_rate}` is **not identified by a
+  static vanilla surface** (free it in the fit and it collapses to zero). Three ways to set it:
+  - *prior* -- defaults `0.18 / 0.15` (calm / mid / stressed: stressed vol ~1.4x, skew ~3x the calm
+    regime), switch rate from a weak fit to the RR/BF term-structure decay
+    (`report.switch_rate_identified`), or a realised-vol regime study;
+  - *`barrier_quotes=`* -- a list of `OneTouchQuote`. The calibration then **alternates**
+    `n_barrier_rounds` times between the vanilla `(a, b)` fit and a fit of
+    `{level_spread, skew_spread, switch_rate}` to the touch prices (`barriers.py`), which *do* carry
+    the forward-smile / path-dependence information. `report.barrier_rms_price_error` /
+    `n_barrier_quotes`. Touches identify the overall vol dispersion and (when switching is fast) the
+    switch rate well; the level-vs-skew split is only partly identified, so `skew_spread` carries a
+    weak Tikhonov pull toward the prior. ~30-60 s for ~8 quotes.
 
 The regimes / generator are all `time_varying`, so the pricer (either one) rebuilds its FD operators
 per segment. Vega on a calibrated model is a parallel shift of the whole local-vol surface. On the
@@ -181,8 +185,10 @@ structure, and a forward-vol calibration target, are the next refinements.
 - `test_seasoned_tarf.py` -- past fixings dropped, valuation-date fixing priced in, grid-resolution
   passthrough on the `front_arena` wrappers.
 - `test_surface_calibration.py` -- market-strangle reconstruction, arbitrage-free SVI (butterfly /
-  calendar), analytic Dupire, the forward vanilla PDE (Black-Scholes limit + mixture smile), and the
-  two-stage full-surface fit.
+  calendar), analytic Dupire, the forward vanilla PDE (Black-Scholes limit + mixture smile), the
+  full-surface fit, and `n_regimes=1` vs `3`.
+- `test_barriers.py` -- one-touch vs the Rubinstein-Reiner closed form, touch/KO parity identities,
+  and the regime-structure calibration from one-touch quotes (synthetic round-trip).
 
 ## Front Arena AEF interface
 
@@ -196,9 +202,9 @@ and `front_arena.ADFL_EXAMPLE_MARKET_DATA`.
 
 Worked examples with mock FA market-data objects are in `examples/` -- `price_usdchf_tarf.py`
 (a fresh USDCHF seller TARF), `price_seasoned_tarf.py` (the same deal valued mid-life), each with
-a flat-vol Monte-Carlo cross-check, and `calibrate_usdchf_surface.py` (calibrate the 3-regime model
-to a full 10-tenor USDCHF surface, then price the seasoned TARF with it). Run e.g.
-`python examples/calibrate_usdchf_surface.py`.
+a flat-vol Monte-Carlo cross-check, `calibrate_usdchf_surface.py` (calibrate to a full 10-tenor
+USDCHF surface; `n_regimes=1` vs `3`), and `calibrate_from_barriers.py` (calibrate the 3-regime
+structural parameters to one-touch quotes). Run e.g. `python examples/calibrate_from_barriers.py`.
 
 ## Run tests
 

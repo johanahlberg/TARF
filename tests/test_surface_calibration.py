@@ -221,7 +221,7 @@ def test_fxvolsurface_is_svi_backed_and_arbitrage_free():
 def test_calibrate_regime_model_full_pipeline():
     surface = _skew_surface()
     model, report = calibrate_regime_model(
-        surface, [0.25, 0.5, 0.25], level_spread=0.15, skew_spread=0.12,
+        surface, [0.25, 0.5, 0.25], n_regimes=3, level_spread=0.15, skew_spread=0.12,
         target="hybrid", n_pde_passes=2, num_x=401, steps_per_year=300, dupire_nt=21, dupire_nx=101,
     )
     assert report.rms_vol_error < 1e-3          # regime dispersion costs ~2 bp vs pure Dupire

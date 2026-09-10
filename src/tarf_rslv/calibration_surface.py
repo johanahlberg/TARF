@@ -339,6 +339,39 @@ class SurfaceCalibrationReport:
     switch_rate_identified: bool
     n_pde_passes: int
     n_residual_evals: int
+    barrier_rms_price_error: float = float("nan")   # set when barrier_quotes are given
+    n_barrier_quotes: int = 0
+
+
+def _fit_barrier_structural(surface, params_at_x, weights, quotes, x_grid, t_grid, max_t, x0, verbose):
+    """Fit (level_spread, skew_spread, switch_rate) to the barrier/touch quotes, given the
+    already-fitted per-tenor SVI (a, b)."""
+    from .barriers import RegimeBarrierPricer
+
+    market = np.array([qt.market_price for qt in quotes])
+    qweight = np.array([qt.weight for qt in quotes])
+
+    def resid(theta: np.ndarray) -> np.ndarray:
+        ls, ss, rate = float(theta[0]), float(theta[1]), float(theta[2])
+        params = replace(params_at_x, level_spread=ls, skew_spread=ss)
+        model = _build_model(surface, params, _generator(rate, weights), weights, x_grid, t_grid, max_t, 3)
+        pricer = RegimeBarrierPricer(model, num_spot=221, steps_per_year=400, min_steps=100)
+        model_prices = np.array([qt.model_price(pricer) for qt in quotes])
+        # weak Tikhonov on skew_spread only: with few / symmetric touches it trades off against
+        # level_spread; the switch rate and overall dispersion are identified, the split is not
+        skew_pull = 0.04 * (ss - _DEFAULT_SKEW_SPREAD * ls / max(_DEFAULT_LEVEL_SPREAD, 1e-6))
+        return np.concatenate([(model_prices - market) * qweight, [skew_pull]])
+
+    sol = least_squares(
+        resid, np.asarray(x0, dtype=float),
+        bounds=([0.0, 0.0, 0.2], [0.45, 0.55, 12.0]),
+        x_scale=[0.05, 0.05, 2.0], diff_step=[0.03, 0.03, 0.15], max_nfev=45, ftol=1e-6, xtol=1e-6,
+    )
+    rms = float(np.sqrt(np.mean(sol.fun[:len(quotes)] ** 2)))
+    if verbose:
+        print(f"  [barriers] level_spread={sol.x[0]:.3f} skew_spread={sol.x[1]:.3f} "
+              f"switch_rate={sol.x[2]:.2f}  rms price err {rms * 1e4:.1f} bp")
+    return tuple(float(v) for v in sol.x), rms
 
 
 def _arbitrage_diagnostics(params: SharedSmileParams, n_regimes: int = 3) -> tuple[float, float]:
@@ -456,10 +489,12 @@ def calibrate_regime_model(
     surface: FXVolSurface,
     regime_weights: np.ndarray | list[float] = (0.25, 0.5, 0.25),
     *,
-    n_regimes: int = 3,
+    n_regimes: int = 1,
     level_spread: float = _DEFAULT_LEVEL_SPREAD,
     skew_spread: float = _DEFAULT_SKEW_SPREAD,
     calibrate_q: bool = True,
+    barrier_quotes: list | None = None,
+    n_barrier_rounds: int = 2,
     q: np.ndarray | None = None,
     target: str = "hybrid",
     n_pde_passes: int = 3,
@@ -473,12 +508,21 @@ def calibrate_regime_model(
 ) -> tuple[CalibratedRegimeModel, SurfaceCalibrationReport]:
     """Calibrate the model to ``surface`` and return a ready-to-price :class:`CalibratedRegimeModel`.
 
-    ``n_regimes=1`` -- a **single Dupire local-vol** model on the arbitrage-free SVI surface (priced
-    by ``SingleRegimePricer``, ~3x faster, no forward-smile dynamics). ``n_regimes=3`` (default) --
-    the coupled regime-switching model: regimes differ in level and skew by ``level_spread`` /
-    ``skew_spread`` (a regime interpretation, *not* calibrated -- a static surface does not identify
-    regime dispersion), and stage 2 (``calibrate_q``) fits the switch rate to the RR/BF decay with
-    maturity (weakly identified, persistence-prior fallback -- ``report.switch_rate_identified``).
+    ``n_regimes=1`` (default) -- a **single Dupire local-vol** model on the arbitrage-free SVI
+    surface (priced by ``SingleRegimePricer``, ~3x faster, no forward-smile dynamics).
+    ``n_regimes=3`` -- the coupled regime-switching model: regimes differ in level and skew by
+    ``level_spread`` / ``skew_spread``.
+
+    A static vanilla surface does **not** identify the regime structure. There are three ways to set
+    it, in increasing order of soundness:
+
+    * defaults / a realised-vol regime prior (``level_spread`` / ``skew_spread`` as given; the switch
+      rate from ``calibrate_q`` against the RR/BF decay, which is only weakly identified);
+    * ``barrier_quotes`` -- a list of :class:`~tarf_rslv.barriers.OneTouchQuote`: the calibration then
+      **alternates** ``n_barrier_rounds`` times between refitting the per-tenor SVI ``(a, b)`` to the
+      vanilla surface and fitting ``{level_spread, skew_spread, switch_rate}`` to the touch/barrier
+      prices (which *do* carry the forward-smile / path-dependence information). ``calibrate_q`` is
+      then ignored.
 
     Stage 1 always fits per-tenor SVI ``(a, b)`` so the model reprices the whole surface.
     ``target``: ``"hybrid"`` (default) fits a smooth mixture surrogate re-anchored ``n_pde_passes``
@@ -488,6 +532,8 @@ def calibrate_regime_model(
         raise ValueError("n_regimes must be 1 or 3")
     if target not in {"hybrid", "pde", "mixture"}:
         raise ValueError("target must be 'hybrid', 'pde' or 'mixture'")
+    if barrier_quotes and n_regimes != 3:
+        raise ValueError("barrier calibration needs n_regimes=3 (there is nothing to fit otherwise)")
 
     if n_regimes == 1:
         weights = np.array([1.0])
@@ -560,7 +606,22 @@ def calibrate_regime_model(
     x, ok = run_stage1(template.free_vector(), q, passes, label="[stage1] ")
 
     switch_rate, identified = _PRIOR_SWITCH_RATE, False
-    if calibrate_q:
+    barrier_rms = float("nan")
+    n_bq = len(barrier_quotes) if barrier_quotes else 0
+
+    if barrier_quotes:
+        ls, ss, rate = level_spread, skew_spread, _PRIOR_SWITCH_RATE
+        for rnd in range(max(1, n_barrier_rounds)):
+            template = SharedSmileParams.from_surface(surface, ls, ss)
+            x, ok = run_stage1(x, _generator(rate, weights), max(2, passes - 1), label=f"[bar{rnd + 1} s1] ")
+            (ls, ss, rate), barrier_rms = _fit_barrier_structural(
+                surface, template.with_free_vector(x), weights, barrier_quotes,
+                x_grid, t_grid, max_t, (ls, ss, rate), verbose,
+            )
+        template = SharedSmileParams.from_surface(surface, ls, ss)
+        q = _generator(rate, weights)
+        switch_rate, identified = rate, True
+    elif calibrate_q:
         model = _build_model(surface, template.with_free_vector(x), q, weights, x_grid, t_grid, max_t, n_regimes)
         switch_rate, identified = calibrate_switch_rate(model)
         q = _generator(switch_rate, weights)
@@ -593,14 +654,17 @@ def calibrate_regime_model(
         switch_rate_identified=identified,
         n_pde_passes=passes,
         n_residual_evals=evals["n"],
+        barrier_rms_price_error=barrier_rms,
+        n_barrier_quotes=n_bq,
     )
     return model, report
 
 
 def calibrate_regime_surface(surface, regime_weights=(0.25, 0.5, 0.25), q=None, **kwargs):
-    """Backward-compatible alias: stage 1 only unless ``calibrate_q=True`` is passed. Accepts the old
-    ``spread=`` keyword as ``level_spread``."""
+    """Backward-compatible alias: the three-regime model, stage 1 only unless ``calibrate_q=True``.
+    Accepts the old ``spread=`` keyword as ``level_spread``."""
     if "spread" in kwargs:
         kwargs["level_spread"] = kwargs.pop("spread")
+    kwargs.setdefault("n_regimes", 3)
     kwargs.setdefault("calibrate_q", False)
     return calibrate_regime_model(surface, regime_weights, q=q, **kwargs)
