@@ -376,15 +376,16 @@ def fx_surface_from_quotes(
     *,
     bf_convention: str = "market_strangle",
     delta_type: str = "spot",
-    premium_adjusted: bool = False,
     atm_convention: str = "dns",
+    premium: str | bool = "domestic",
 ) -> FXVolSurface:
     """Build an :class:`FXVolSurface` from quote arrays (ATM / 25d & 10d RR & BF per tenor) and two
     FA ``FIrCurveInformation`` objects.
 
     ``bf_convention="market_strangle"`` for broker quotes (default), ``"smile"`` if the butterflies
-    are already smile-vol butterflies. Set the delta / ATM conventions to match your quote source
-    (for USDCHF the premium is CHF, so ``premium_adjusted=False``).
+    are already smile-vol butterflies. ``delta_type`` / ``atm_convention`` / ``premium`` are the
+    per-currency-pair market conventions -- see :meth:`DeltaConvention.from_market` (for USDCHF:
+    spot delta, DNS, premium in CHF -> ``premium="domestic"``).
     """
     smiles = [
         SmileQuotes(float(t), float(a), float(r25), float(b25), float(r10), float(b10), bf_convention)
@@ -395,7 +396,7 @@ def fx_surface_from_quotes(
         smiles=smiles,
         domestic_zero=_zero_rate_fn(domestic_curve, valuation_date, "domestic_curve"),
         foreign_zero=_zero_rate_fn(foreign_curve, valuation_date, "foreign_curve"),
-        convention=DeltaConvention(delta_type, premium_adjusted, atm_convention),
+        convention=DeltaConvention.from_market(delta_type, atm_convention, premium),
     )
 
 
@@ -409,15 +410,16 @@ def market_surface_from_front_arena(
     *,
     bf_convention: str = "smile",
     delta_type: str = "spot",
-    premium_adjusted: bool = False,
     atm_convention: str = "dns",
+    premium: str | bool = "domestic",
 ) -> FXVolSurface:
     """Query a delta-parametrised FA vol object (``Value(expiry, delta, fRate, dRate)``) at
     +-10d / +-25d / ATM for each expiry and assemble an :class:`FXVolSurface`.
 
-    A pure ``FMalzParametricVolatilityInformation`` carries only 25d information, so its 10d values
-    are the parabola's own extrapolation -- pass genuine 10d quotes through ``fx_surface_from_quotes``
-    when you have them.
+    ``delta_type`` / ``atm_convention`` / ``premium`` are the per-currency-pair market conventions
+    (:meth:`DeltaConvention.from_market`). A pure ``FMalzParametricVolatilityInformation`` carries
+    only 25d information, so its 10d values are the parabola's own extrapolation -- pass genuine 10d
+    quotes through ``fx_surface_from_quotes`` when you have them.
     """
     value = getattr(vol_surface, "Value", None)
     if not callable(value):
@@ -445,8 +447,7 @@ def market_surface_from_front_arena(
 
     return fx_surface_from_quotes(
         spot, valuation_date, tenors, atm, rr25, bf25, rr10, bf10, domestic_curve, foreign_curve,
-        bf_convention=bf_convention, delta_type=delta_type,
-        premium_adjusted=premium_adjusted, atm_convention=atm_convention,
+        bf_convention=bf_convention, delta_type=delta_type, atm_convention=atm_convention, premium=premium,
     )
 
 
@@ -529,6 +530,61 @@ def calibrated_tarf_model_from_surface(
     }
 
 
+def calibrated_tarf_model_from_front_arena(
+    valuation_date: date,
+    spot_value: object,
+    strike_value: object,
+    target_level: float,
+    fixing_times: Sequence[float],
+    maturity: float,
+    surface_maturity_dates: Sequence[date],
+    domestic_curve: object,
+    foreign_curve: object,
+    vol_surface: object,
+    *,
+    delta_type: str = "spot",
+    atm_convention: str = "dns",
+    premium: str | bool = "domestic",
+    n_regimes: int = 1,
+    regime_weights: Sequence[float] = (0.25, 0.5, 0.25),
+    q_matrix: Sequence[Sequence[float]] | None = None,
+    regime_level_spread: float = 0.18,
+    regime_skew_spread: float = 0.15,
+    barrier_quotes: list | None = None,
+    is_call_option: bool = True,
+    notional1: Sequence[float] | float = 1.0,
+    notional2: Sequence[float] | float = 1.0,
+    barrier: float = 0.0,
+    target_adjustment: int = 0,
+    inverted_target: bool = False,
+    accumulated_value: float = 0.0,
+    num_spot: int = 161,
+    num_target: int = 100,
+    n_steps: int = 120,
+    calibrate_q: bool = True,
+    calibration_kwargs: dict | None = None,
+) -> dict[str, object]:
+    """One call: read the FA market-data objects + the currency-pair conventions
+    (``delta_type`` / ``atm_convention`` / ``premium``), build the arbitrage-free SVI surface,
+    calibrate the local-vol model (single- or three-regime), and price the TARF. The mandatory
+    return key is ``result``; ``calibration`` carries the fit diagnostics."""
+    surface = market_surface_from_front_arena(
+        _denominated_number(spot_value, "spot_value"), valuation_date, surface_maturity_dates,
+        domestic_curve, foreign_curve, vol_surface,
+        delta_type=delta_type, atm_convention=atm_convention, premium=premium,
+    )
+    return calibrated_tarf_model_from_surface(
+        valuation_date, spot_value, strike_value, target_level, fixing_times, maturity, surface,
+        n_regimes=n_regimes, regime_weights=regime_weights, q_matrix=q_matrix,
+        regime_level_spread=regime_level_spread, regime_skew_spread=regime_skew_spread,
+        barrier_quotes=barrier_quotes, is_call_option=is_call_option,
+        notional1=notional1, notional2=notional2, barrier=barrier,
+        target_adjustment=target_adjustment, inverted_target=inverted_target,
+        accumulated_value=accumulated_value, num_spot=num_spot, num_target=num_target, n_steps=n_steps,
+        calibrate_q=calibrate_q, calibration_kwargs=calibration_kwargs,
+    )
+
+
 ADFL_EXAMPLE = """\
 [AEF PV&R]FObject:tarfModel =
     Definition=tarfModel(date valuationDate, denominatedvalue spotValue,
@@ -574,4 +630,29 @@ ADFL_EXAMPLE_MARKET_DATA = """\
     fixingTimes, domesticCurve, foreignCurve, volSurface, regimeWeights,
     qMatrix, isCallOption, notional1, notional2, barrier, targetAdjustment,
     invertedTarget, accumulatedValue);
+"""
+
+ADFL_EXAMPLE_CALIBRATED = """\
+[AEF PV&R]FObject:calibratedTarfModel =
+    Definition=calibratedTarfModel(date valuationDate, denominatedvalue spotValue,
+        denominatedvalue strikeValue, double targetLevel, array(double) fixingTimes,
+        double maturity, array(date) surfaceMaturityDates,
+        FIrCurveInformation domesticCurve, FIrCurveInformation foreignCurve,
+        FMalzParametricVolatilityInformation volSurface,
+        string deltaType, string atmConvention, string premium,
+        int nRegimes): FDictionary
+    Function=TarfValuation.calibrated_tarf_model_from_front_arena
+
+[AEF PV&R]FInstrument:tarfValuationDescriptor = {
+    theoreticalModelCall->"calibratedTarfModelCall"
+}
+
+# deltaType / atmConvention / premium are read from the currency pair:
+#   deltaType      "spot" | "forward"
+#   atmConvention  "forward" | "dns"   (delta-neutral straddle)
+#   premium        "domestic" (pips of the terms ccy) | "foreign" (% of the base ccy)
+[AEF PV&R]FInstrument:calibratedTarfModelCall = calibratedTarfModel(
+    valuationDate, spotValue, strikeValue, targetLevel, fixingTimes, maturity,
+    surfaceMaturityDates, domesticCurve, foreignCurve, volSurface,
+    pairDeltaType, pairAtmConvention, pairPremiumConvention, nRegimes);
 """

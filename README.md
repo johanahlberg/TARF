@@ -118,7 +118,7 @@ is kept only for comparison.
 - **Market side** (`vol_surface.py`, `svi.py`). Broker quotes per tenor are `atm`, `rr25`, `bf25`,
   `rr10`, `bf10`; the butterflies are **market strangles**, so each wing's smile vols are recovered
   by the price-matching root-find (Reiswich & Wystup). Delta<->strike uses configurable conventions
-  (`DeltaConvention`: spot/forward delta, premium adjustment, ATM = DNS / forward / spot). Each tenor
+  (`DeltaConvention.from_market(delta_type, atm_convention, premium)` -- per-pair, see table below). Each tenor
   is then fitted with one **arbitrage-free SVI** slice (`fit_svi_surface`): joint least squares with
   the Durrleman butterfly condition `g(k) >= 0` and non-crossing (calendar) constraints as penalties,
   Roger Lee wing bound `b(1+|rho|) <= 2`. The SVI form is smooth and defined for all `k` -- the wings
@@ -160,10 +160,18 @@ sample USDCHF deal the regime overlay moves the seasoned-TARF price only ~1 pip 
 model -- so `n_regimes=1` is a reasonable production starting point, with `n_regimes=3` available
 when forward-smile risk on a given deal matters.
 
-Front Arena entry points: `market_surface_from_front_arena` (queries a delta-parametrised vol object
-at +-10d/+-25d/ATM -- expects a full surface), `fx_surface_from_quotes` (quote arrays +
-`FIrCurveInformation` objects), and `calibrated_tarf_model_from_surface` (calibrate + price in one
-call; `result` plus the fit report). Worked example: `examples/calibrate_usdchf_surface.py`.
+Front Arena entry points: `calibrated_tarf_model_from_front_arena` (**one call**: FA curves + Malz
+surface + deal -> arb-free SVI surface -> calibrate -> price), or `market_surface_from_front_arena`
+/ `fx_surface_from_quotes` -> `calibrated_tarf_model_from_surface`. All take the three
+per-currency-pair market conventions as strings (`DeltaConvention.from_market`):
+
+| parameter | values | means |
+|---|---|---|
+| `delta_type` | `"spot"` / `"forward"` (`"fwd"`) | Black-Scholes delta definition |
+| `atm_convention` | `"dns"` / `"forward"` (`"fwd"`, `"atmf"`) | delta-neutral straddle vs `K = F` |
+| `premium` | `"domestic"` / `"foreign"` | price in terms-ccy pips (unadjusted delta) vs base-ccy % (premium-adjusted) |
+
+Worked examples: `examples/calibrate_usdchf_surface.py`, `examples/calibrate_from_barriers.py`.
 
 Remaining limitations: regime dispersion (`level_spread` / `skew_spread`) and, largely, the switch
 rate are **not identified by vanillas** -- they are priors, and forward-starting vol quotes are what

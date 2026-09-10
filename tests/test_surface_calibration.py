@@ -300,7 +300,50 @@ def test_fx_surface_from_quotes_and_from_front_arena_objects():
     surf2 = market_surface_from_front_arena(
         0.81, val, [date(2027, 3, 9), date(2027, 9, 9)], dom, forgn,
         _FakeMalzSurface(0.072, -0.006, 0.0018),
+        delta_type="forward", atm_convention="atmf", premium="foreign",
     )
     assert len(surf2.smiles) == 2
     nodes = surf2.market_nodes()
     assert np.all(np.isfinite([iv for _, _, iv, _ in nodes]))
+    assert surf2.convention.delta_type == "forward"
+    assert surf2.convention.atm_convention == "forward"
+    assert surf2.convention.premium_adjusted is True
+
+
+def test_delta_convention_from_market_strings():
+    from tarf_rslv.vol_surface import DeltaConvention
+
+    c = DeltaConvention.from_market("fwd", "atmf", "%foreign")
+    assert (c.delta_type, c.atm_convention, c.premium_adjusted) == ("forward", "forward", True)
+    d = DeltaConvention.from_market("spot", "delta_neutral_straddle", "domestic")
+    assert (d.delta_type, d.atm_convention, d.premium_adjusted) == ("spot", "dns", False)
+    with pytest.raises(ValueError):
+        DeltaConvention.from_market("spot", "dns", "sideways")
+
+
+def test_calibrated_tarf_model_from_front_arena_one_call():
+    from datetime import date
+
+    from tarf_rslv import calibrated_tarf_model_from_front_arena
+
+    class _DV:
+        def __init__(self, n, u):
+            self._n, self._u = n, u
+
+        def Number(self):
+            return self._n
+
+        def Unit(self):
+            return self._u
+
+    val = date(2026, 9, 9)
+    out = calibrated_tarf_model_from_front_arena(
+        val, _DV(0.81, "CHF"), _DV(0.82, "CHF"), 0.10, [0.25, 0.5, 0.75, 1.0], 1.0,
+        [date(2026, 12, 9), date(2027, 6, 9), date(2027, 9, 9)],
+        _FakeCurve(0.011), _FakeCurve(0.046), _FakeMalzSurface(0.072, -0.006, 0.0018),
+        delta_type="spot", atm_convention="dns", premium="domestic", n_regimes=1,
+        num_spot=101, num_target=50, n_steps=60,
+    )
+    assert set(out) == {"result", "calibration"}
+    assert np.isfinite(out["result"].number)
+    assert out["calibration"]["n_regimes"] == 1

@@ -11,6 +11,7 @@ from .calibration import (
 from .front_arena import (
     DEFAULT_REGIME_DELTAS,
     FallbackDenominatedValue,
+    calibrated_tarf_model_from_front_arena,
     calibrated_tarf_model_from_surface,
     fx_surface_from_quotes,
     market_data_from_front_arena,
@@ -71,6 +72,7 @@ __all__ = [
     "fx_surface_from_quotes",
     "market_surface_from_front_arena",
     "calibrated_tarf_model_from_surface",
+    "calibrated_tarf_model_from_front_arena",
     "RegimeBarrierPricer",
     "OneTouchQuote",
 ]

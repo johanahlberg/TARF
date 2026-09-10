@@ -12,12 +12,14 @@ add to the ATM level so that a strangle struck at the resulting ``+-d`` strikes 
 price as the true smile strangle. Recovering the smile from the market strangle is a small
 root-find per wing per tenor (Reiswich & Wystup 2010), done in ``SmileQuotes.knots``.
 
-Conventions (all configurable on ``FXVolSurface``):
+Per-currency-pair market conventions (``DeltaConvention``; build from strings with
+``DeltaConvention.from_market(delta_type, atm_convention, premium)``):
 
-* ``delta_type``      -- "spot" (default) or "forward" Black-Scholes delta,
-* ``premium_adjusted`` -- whether delta is premium-adjusted (default ``False``; correct when the
-  option premium is paid in the *domestic* / terms currency, e.g. CHF for USDCHF),
-* ``atm_convention``  -- "dns" delta-neutral straddle (default), "forward" (K = F) or "spot".
+* ``delta_type``      -- "spot" (default) or "forward" ("fwd") Black-Scholes delta,
+* ``atm_convention``  -- "dns" delta-neutral straddle (default) or "forward" ("fwd" / "atmf", K = F),
+* ``premium``         -- how the option price is quoted: "domestic" (pips of the terms currency;
+  delta not premium-adjusted -- e.g. CHF for USDCHF) or "foreign" (% of the base currency;
+  premium-adjusted).
 """
 
 from __future__ import annotations
@@ -81,8 +83,30 @@ def implied_vol_from_forward_price(
 # --------------------------------------------------------------------------------------------------
 # FX delta <-> strike
 # --------------------------------------------------------------------------------------------------
+_DELTA_TYPE_ALIASES = {
+    "spot": "spot", "s": "spot", "spot_delta": "spot",
+    "forward": "forward", "fwd": "forward", "f": "forward", "forward_delta": "forward",
+}
+_ATM_ALIASES = {
+    "forward": "forward", "fwd": "forward", "atmf": "forward", "atm_forward": "forward", "f": "forward",
+    "dns": "dns", "delta_neutral": "dns", "delta_neutral_straddle": "dns", "delta-neutral": "dns",
+    "delta_neutral_atm": "dns", "straddle": "dns",
+    "spot": "spot",
+}
+# how the option price / premium is quoted -> whether delta is premium-adjusted
+_PREMIUM_ADJUSTED = {
+    "domestic": False, "%domestic": False, "domestic_pips": False, "pips": False,
+    "unadjusted": False, "excluded": False, "premium_excluded": False, "terms": False, "false": False,
+    "foreign": True, "%foreign": True, "foreign_pct": True, "pct": True, "%f": True,
+    "adjusted": True, "included": True, "premium_included": True, "base": True, "true": True,
+}
+
+
 @dataclass(frozen=True)
 class DeltaConvention:
+    """FX market conventions for the smile: how delta is defined, what "ATM" means, and whether delta
+    is premium-adjusted (which follows from the currency the option price is quoted in)."""
+
     delta_type: str = "spot"          # "spot" | "forward"
     premium_adjusted: bool = False
     atm_convention: str = "dns"        # "dns" | "forward" | "spot"
@@ -92,6 +116,32 @@ class DeltaConvention:
             raise ValueError("delta_type must be 'spot' or 'forward'")
         if self.atm_convention not in {"dns", "forward", "spot"}:
             raise ValueError("atm_convention must be 'dns', 'forward' or 'spot'")
+
+    @classmethod
+    def from_market(
+        cls, delta_type: str = "spot", atm_convention: str = "dns", premium: str | bool = "domestic",
+    ) -> "DeltaConvention":
+        """Build from per-currency-pair strings (as configured in Front Arena):
+
+        * ``delta_type``     -- "spot" or "forward" ("fwd");
+        * ``atm_convention`` -- "forward" ("fwd" / "atmf") or "dns" (delta-neutral straddle);
+        * ``premium``        -- the price/premium convention: "domestic" (pips of the terms currency;
+          delta not premium-adjusted) or "foreign" (% of the base currency; premium-adjusted). A
+          bool is also accepted directly as ``premium_adjusted``.
+        """
+        dt = _DELTA_TYPE_ALIASES.get(str(delta_type).strip().lower())
+        atm = _ATM_ALIASES.get(str(atm_convention).strip().lower())
+        if dt is None:
+            raise ValueError(f"unknown delta_type {delta_type!r}")
+        if atm is None:
+            raise ValueError(f"unknown atm_convention {atm_convention!r}")
+        if isinstance(premium, bool):
+            pa = premium
+        else:
+            pa = _PREMIUM_ADJUSTED.get(str(premium).strip().lower())
+            if pa is None:
+                raise ValueError(f"unknown premium convention {premium!r} (use 'domestic' or 'foreign')")
+        return cls(delta_type=dt, premium_adjusted=pa, atm_convention=atm)
 
 
 def atm_strike(
