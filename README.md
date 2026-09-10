@@ -99,12 +99,19 @@ are lightweight and used by the interface tests.
 
 ## Full vol-surface calibration
 
-`calibration_surface.calibrate_regime_model` fits the three-regime model to a **whole FX vol
-surface** -- every tenor, five strikes per tenor (10d put, 25d put, ATM, 25d call, 10d call) -- and
-returns a `CalibratedRegimeModel` ready for `ThreeRegimePricer`. This is the production path;
-`front_arena.calibrated_tarf_model_from_surface` is its AEF wrapper. The legacy
-`tarf_model_from_market_data` (three delta points used as flat regime vols) is kept only for
-comparison.
+`calibration_surface.calibrate_regime_model(surface, n_regimes=1 or 3)` fits the local-vol model to
+a **whole FX vol surface** -- every tenor, five strikes per tenor (10d put, 25d put, ATM, 25d call,
+10d call) -- and returns a `CalibratedRegimeModel` whose `.price_tarf(...)` / `.tarf_greeks(...)`
+**self-dispatch**:
+
+| `n_regimes` | model | pricer | speed | forward-smile dynamics |
+|---|---|---|---|---|
+| **1** | single Dupire local vol on the arb-free surface | `SingleRegimePricer` | ~3x faster; calibration ~trivial (Dupire *is* the fit) | none (a known local-vol shortcoming) |
+| **3** (default) | coupled regime-switching, regimes differ in level & skew | `ThreeRegimePricer` | | yes, from the regime overlay |
+
+So switching between them is one argument. `front_arena.calibrated_tarf_model_from_surface` takes the
+same `n_regimes`. The legacy `tarf_model_from_market_data` (three delta points as flat regime vols)
+is kept only for comparison.
 
 - **Market side** (`vol_surface.py`, `svi.py`). Broker quotes per tenor are `atm`, `rr25`, `bf25`,
   `rr10`, `bf10`; the butterflies are **market strangles**, so each wing's smile vols are recovered
@@ -143,9 +150,11 @@ comparison.
   whole rate range): a coarse grid, falling back to a persistence prior (regimes ~6 months) when the
   term structure does not respond -- `report.switch_rate_identified` says which.
 
-The result is a `CalibratedRegimeModel` -- three **time-dependent** Dupire regimes plus the
-generator -- and `ThreeRegimePricer` rebuilds its FD operators per segment when `model.time_varying`.
-Vega on a calibrated model is a parallel shift of the whole local-vol surface.
+The regimes / generator are all `time_varying`, so the pricer (either one) rebuilds its FD operators
+per segment. Vega on a calibrated model is a parallel shift of the whole local-vol surface. On the
+sample USDCHF deal the regime overlay moves the seasoned-TARF price only ~1 pip vs the single Dupire
+model -- so `n_regimes=1` is a reasonable production starting point, with `n_regimes=3` available
+when forward-smile risk on a given deal matters.
 
 Front Arena entry points: `market_surface_from_front_arena` (queries a delta-parametrised vol object
 at +-10d/+-25d/ATM -- expects a full surface), `fx_surface_from_quotes` (quote arrays +

@@ -362,17 +362,21 @@ class SingleRegimePricer:
         delta = v_x / s0
         gamma = (v_xx - v_x) / (s0 * s0)
 
-        bumped = SingleRegimeLocalVolModel(
-            spot=self.model.spot,
-            rate=self.model.rate,
-            dividend_yield=self.model.dividend_yield,
-            local_vol=self.model.local_vol + vega_bump,
-            strike=self.model.strike,
-            skew=self.model.skew,
-            curvature=self.model.curvature,
-            smile_ref=self.model.smile_ref,
-            vol_floor=self.model.vol_floor,
-        )
+        if getattr(self.model, "time_varying", False):
+            # calibrated (Dupire) model: bump the whole local-vol surface by a parallel shift
+            bumped = self.model.bumped_vol(vega_bump)
+        else:
+            bumped = SingleRegimeLocalVolModel(
+                spot=self.model.spot,
+                rate=self.model.rate,
+                dividend_yield=self.model.dividend_yield,
+                local_vol=self.model.local_vol + vega_bump,
+                strike=self.model.strike,
+                skew=self.model.skew,
+                curvature=self.model.curvature,
+                smile_ref=self.model.smile_ref,
+                vol_floor=self.model.vol_floor,
+            )
         price_up = SingleRegimePricer(bumped, self.num_spot, self.num_target, self.n_steps).price_tarf(tarf, maturity)
         vega = (price_up - price) / vega_bump * 0.01
 

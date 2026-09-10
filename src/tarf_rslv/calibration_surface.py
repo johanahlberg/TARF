@@ -1,6 +1,9 @@
-"""Full FX-surface calibration for the three-regime local-vol model.
+"""Full FX-surface calibration for the local-vol model, single- or three-regime.
 
-``calibrate_regime_model`` runs two stages, kept independent (as in :mod:`tarf_rslv.calibration`):
+``calibrate_regime_model(surface, n_regimes=1 or 3)`` returns a :class:`CalibratedRegimeModel` whose
+``price_tarf`` / ``tarf_greeks`` dispatch to ``SingleRegimePricer`` (``n_regimes=1`` -- a single
+Dupire local-vol model, ~3x faster, no forward-smile dynamics) or ``ThreeRegimePricer``
+(``n_regimes=3``, default). It runs two stages, kept independent (as in :mod:`tarf_rslv.calibration`):
 
 **Stage 1 -- static smile, to the whole surface.** Each tenor is fitted once with an arbitrage-free
 **SVI** slice (``svi.fit_svi_surface``); the calibration then moves only that slice's level /
@@ -153,6 +156,9 @@ class _LocalVolRegime:
 
 @dataclass
 class CalibratedRegimeModel:
+    """Calibrated model. Holds one *or* three time-dependent Dupire regimes; ``price_tarf`` /
+    ``tarf_greeks`` dispatch to ``SingleRegimePricer`` (n = 1) or ``ThreeRegimePricer`` (n = 3)."""
+
     spot: float
     rate: float
     dividend_yield: float
@@ -163,6 +169,10 @@ class CalibratedRegimeModel:
     surface: FXVolSurface
     time_varying: bool = True
 
+    @property
+    def n_regimes(self) -> int:
+        return len(self.regimes)
+
     def bumped_vol(self, dv: float) -> "CalibratedRegimeModel":
         return replace(self, regimes=[r.shifted(dv) for r in self.regimes])
 
@@ -170,10 +180,53 @@ class CalibratedRegimeModel:
         w, _, _, _ = svi_total_variance_and_derivs(self.params.regime_slices(i), max(float(t), 1e-8), y)
         return np.sqrt(np.maximum(w, 1e-12) / max(float(t), 1e-8))
 
+    # -- SingleRegimeLocalVolModel interface (used when n_regimes == 1) ---------------------
+    @property
+    def sigma_ref(self) -> float:
+        return self.regimes[0].sigma_ref
 
-def _regime_local_vol_grids(params, forward_of_t, x_grid, t_grid, vol_floor, vol_cap):
+    @property
+    def local_vol(self) -> float:
+        return self.regimes[0].local_vol
+
+    @property
+    def strike(self) -> float:
+        return self.regimes[0].smile_ref
+
+    skew = 0.0
+    curvature = 0.0
+
+    @property
+    def smile_ref(self) -> float:
+        return self.regimes[0].smile_ref
+
+    @property
+    def vol_floor(self) -> float:
+        return self.regimes[0].vol_floor
+
+    def local_volatility(self, spot, t: float = 0.0) -> np.ndarray:
+        return self.regimes[0].local_volatility(spot, t)
+
+    # -- pricing dispatch -----------------------------------------------------------------
+    def _pricer(self, num_spot: int, num_target: int, n_steps: int):
+        from .solver import SingleRegimePricer, ThreeRegimePricer
+
+        if self.n_regimes == 1:
+            return SingleRegimePricer(self, num_spot, num_target, n_steps)
+        return ThreeRegimePricer(self, self.regime_weights, num_spot, num_target, n_steps)
+
+    def price_tarf(self, tarf, maturity: float, *, num_spot: int = 161, num_target: int = 100,
+                   n_steps: int = 120) -> float:
+        return self._pricer(num_spot, num_target, n_steps).price_tarf(tarf, float(maturity))
+
+    def tarf_greeks(self, tarf, maturity: float, *, num_spot: int = 161, num_target: int = 100,
+                    n_steps: int = 120, vega_bump: float = 1e-4) -> dict:
+        return self._pricer(num_spot, num_target, n_steps).tarf_greeks(tarf, float(maturity), vega_bump)
+
+
+def _regime_local_vol_grids(params, forward_of_t, x_grid, t_grid, vol_floor, vol_cap, n_regimes):
     grids = []
-    for i in range(3):
+    for i in range(n_regimes):
         regime_slices = params.regime_slices(i)
         rows = np.empty((len(t_grid), len(x_grid)))
         for kk, t in enumerate(t_grid):
@@ -183,16 +236,19 @@ def _regime_local_vol_grids(params, forward_of_t, x_grid, t_grid, vol_floor, vol
     return grids
 
 
-def _build_model(surface, params, q, weights, x_grid, t_grid, max_t):
-    grids = _regime_local_vol_grids(params, surface.forward, x_grid, t_grid, surface.vol_floor, surface.vol_cap)
+def _build_model(surface, params, q, weights, x_grid, t_grid, max_t, n_regimes=3):
+    grids = _regime_local_vol_grids(
+        params, surface.forward, x_grid, t_grid, surface.vol_floor, surface.vol_cap, n_regimes
+    )
     front = params.slices()[0]
     front_atm = float(np.sqrt(max(front.total_variance(0.0), 1e-12) / front.tenor))
+    m = REGIME_MULTIPLIERS if n_regimes == 3 else np.zeros(n_regimes)
     regimes = [
         _LocalVolRegime(
             x_grid, t_grid, grids[i], surface.domestic_zero(max_t), surface.foreign_zero(max_t),
-            front_atm * (1.0 + REGIME_MULTIPLIERS[i] * params.level_spread), surface.vol_floor,
+            front_atm * (1.0 + m[i] * params.level_spread), surface.vol_floor,
         )
-        for i in range(3)
+        for i in range(n_regimes)
     ]
     return CalibratedRegimeModel(
         spot=surface.spot, rate=surface.domestic_zero(max_t), dividend_yield=surface.foreign_zero(max_t),
@@ -217,7 +273,7 @@ def _mixture_implied_vol(model: CalibratedRegimeModel, t: float, y: np.ndarray, 
         strike = forward * np.exp(yy)
         price = sum(
             pi_bar[i] * bs_forward_price(forward, strike, float(model.regime_implied_vol(i, t, np.array([yy]))[0]), t, True)
-            for i in range(3)
+            for i in range(model.n_regimes)
         )
         out[j] = implied_vol_from_forward_price(price, forward, strike, t, True)
     return out
@@ -240,7 +296,7 @@ def _pde_implied_vol_nodes(model, nodes, *, num_x, steps_per_year):
 
     if pde_tenors:
         max_t = max(pde_tenors)
-        sig_ref = float(max(model.regime_implied_vol(1, max_t, np.array([0.0]))[0], 0.05))
+        sig_ref = float(max(model.regime_implied_vol(model.n_regimes // 2, max_t, np.array([0.0]))[0], 0.05))
         local_vol_fns = [(lambda x, tt, r=r: r.local_volatility(np.exp(x), tt)) for r in model.regimes]
         pde = RegimeForwardPDE(
             model.spot, model.rate, model.dividend_yield, local_vol_fns,
@@ -285,10 +341,10 @@ class SurfaceCalibrationReport:
     n_residual_evals: int
 
 
-def _arbitrage_diagnostics(params: SharedSmileParams) -> tuple[float, float]:
-    """Worst butterfly violation over the three regimes, and worst calendar crossing of the base."""
+def _arbitrage_diagnostics(params: SharedSmileParams, n_regimes: int = 3) -> tuple[float, float]:
+    """Worst butterfly violation over the regimes, and worst calendar crossing of the base."""
     bf = 0.0
-    for i in range(3):
+    for i in range(n_regimes):
         for slc in params.regime_slices(i):
             bf = max(bf, float(np.max(np.maximum(-slc.durrleman_g(_ARB_GRID), 0.0))))
     cal = 0.0
@@ -302,7 +358,8 @@ def _arbitrage_diagnostics(params: SharedSmileParams) -> tuple[float, float]:
 # stage 2: switch rate from the 25d risk-reversal + butterfly term structure
 # --------------------------------------------------------------------------------------------------
 def _generator(rate: float, stationary: np.ndarray) -> np.ndarray:
-    return rate * (np.ones((3, 1)) @ stationary[None, :] - np.eye(3))
+    n = len(np.asarray(stationary))
+    return rate * (np.ones((n, 1)) @ np.asarray(stationary)[None, :] - np.eye(n))
 
 
 def _rr_bf_term_structure_from_iv(iv_by_tenor: dict[float, np.ndarray], tenors) -> tuple[np.ndarray, np.ndarray]:
@@ -399,6 +456,7 @@ def calibrate_regime_model(
     surface: FXVolSurface,
     regime_weights: np.ndarray | list[float] = (0.25, 0.5, 0.25),
     *,
+    n_regimes: int = 3,
     level_spread: float = _DEFAULT_LEVEL_SPREAD,
     skew_spread: float = _DEFAULT_SKEW_SPREAD,
     calibrate_q: bool = True,
@@ -413,24 +471,32 @@ def calibrate_regime_model(
     max_nfev_inner: int = 140,
     verbose: bool = False,
 ) -> tuple[CalibratedRegimeModel, SurfaceCalibrationReport]:
-    """Calibrate the full three-regime model to ``surface``.
+    """Calibrate the model to ``surface`` and return a ready-to-price :class:`CalibratedRegimeModel`.
 
-    Stage 1 fits per-tenor SVI ``(a, b)`` so the model reprices the whole surface, *given* the
-    structural priors ``level_spread`` (regime vol dispersion) and ``skew_spread`` (regime skew
-    dispersion) -- these are a regime interpretation, not calibrated (a static surface does not
-    identify them; free them and they go to zero). Stage 2 (``calibrate_q``) fits the switch rate
-    to the RR/BF **decay** with maturity via the forward PDE -- weakly identified, bounded, with a
-    persistence-prior fallback (``report.switch_rate_identified``).
+    ``n_regimes=1`` -- a **single Dupire local-vol** model on the arbitrage-free SVI surface (priced
+    by ``SingleRegimePricer``, ~3x faster, no forward-smile dynamics). ``n_regimes=3`` (default) --
+    the coupled regime-switching model: regimes differ in level and skew by ``level_spread`` /
+    ``skew_spread`` (a regime interpretation, *not* calibrated -- a static surface does not identify
+    regime dispersion), and stage 2 (``calibrate_q``) fits the switch rate to the RR/BF decay with
+    maturity (weakly identified, persistence-prior fallback -- ``report.switch_rate_identified``).
 
-    ``target``: ``"hybrid"`` (default) fits a smooth mixture surrogate inside the optimiser and
-    re-anchors it ``n_pde_passes`` times with the forward-PDE correction. ``"pde"`` fits the forward
-    PDE directly (noisier near the optimum); ``"mixture"`` is the surrogate only.
+    Stage 1 always fits per-tenor SVI ``(a, b)`` so the model reprices the whole surface.
+    ``target``: ``"hybrid"`` (default) fits a smooth mixture surrogate re-anchored ``n_pde_passes``
+    times by the forward-PDE correction; ``"pde"`` / ``"mixture"`` are also available.
     """
-    weights = np.asarray(regime_weights, dtype=float)
-    if weights.shape != (3,) or not np.isclose(weights.sum(), 1.0):
-        raise ValueError("regime_weights must be a length-3 vector summing to 1")
+    if n_regimes not in (1, 3):
+        raise ValueError("n_regimes must be 1 or 3")
     if target not in {"hybrid", "pde", "mixture"}:
         raise ValueError("target must be 'hybrid', 'pde' or 'mixture'")
+
+    if n_regimes == 1:
+        weights = np.array([1.0])
+        level_spread = skew_spread = 0.0
+        calibrate_q = False
+    else:
+        weights = np.asarray(regime_weights, dtype=float)
+        if weights.shape != (3,) or not np.isclose(weights.sum(), 1.0):
+            raise ValueError("regime_weights must be a length-3 vector summing to 1")
     q = (_generator(_PRIOR_SWITCH_RATE, weights) if q is None else np.asarray(q, dtype=float))
 
     nodes = surface.market_nodes()
@@ -468,7 +534,7 @@ def calibrate_regime_model(
 
             def residual(vec, _ref=ref):
                 evals["n"] += 1
-                model = _build_model(surface, template.with_free_vector(vec), q_, weights, x_grid, t_grid, max_t)
+                model = _build_model(surface, template.with_free_vector(vec), q_, weights, x_grid, t_grid, max_t, n_regimes)
                 if target == "pde":
                     return (_pde_implied_vol_nodes(model, nodes, num_x=num_x, steps_per_year=steps_per_year)
                             - market_iv) * vega_w
@@ -479,12 +545,12 @@ def calibrate_regime_model(
             x, ok = sol.x, bool(sol.success)
 
             if target == "hybrid" and outer < passes - 1:
-                model = _build_model(surface, template.with_free_vector(x), q_, weights, x_grid, t_grid, max_t)
+                model = _build_model(surface, template.with_free_vector(x), q_, weights, x_grid, t_grid, max_t, n_regimes)
                 new_corr = (_pde_implied_vol_nodes(model, nodes, num_x=num_x, steps_per_year=steps_per_year)
                             - _mixture_implied_vol_nodes(model, nodes))
                 correction = new_corr if outer == 0 else 0.6 * new_corr + 0.4 * correction  # damped
             if verbose:
-                model = _build_model(surface, template.with_free_vector(x), q_, weights, x_grid, t_grid, max_t)
+                model = _build_model(surface, template.with_free_vector(x), q_, weights, x_grid, t_grid, max_t, n_regimes)
                 chk = _pde_implied_vol_nodes(model, nodes, num_x=num_x, steps_per_year=steps_per_year)
                 print(f"  {label}pass {outer + 1}/{passes}  PDE rms="
                       f"{np.sqrt(np.nanmean((chk - market_iv) ** 2)) * 1e4:6.2f} bp  (evals {evals['n']})")
@@ -495,7 +561,7 @@ def calibrate_regime_model(
 
     switch_rate, identified = _PRIOR_SWITCH_RATE, False
     if calibrate_q:
-        model = _build_model(surface, template.with_free_vector(x), q, weights, x_grid, t_grid, max_t)
+        model = _build_model(surface, template.with_free_vector(x), q, weights, x_grid, t_grid, max_t, n_regimes)
         switch_rate, identified = calibrate_switch_rate(model)
         q = _generator(switch_rate, weights)
         if verbose:
@@ -504,12 +570,12 @@ def calibrate_regime_model(
             x, ok = run_stage1(x, q, max(1, q_refit_passes), label="[refit]  ")
 
     params = template.with_free_vector(x)
-    bf_viol, cal_viol = _arbitrage_diagnostics(params)
+    bf_viol, cal_viol = _arbitrage_diagnostics(params, n_regimes)
     if bf_viol > 5e-4 or cal_viol > 1e-3:                  # nudge the wing scale down to clear it
         params.free[:, 1] = np.minimum(params.free[:, 1], template.free0[:, 1] * 1.4)
-        bf_viol, cal_viol = _arbitrage_diagnostics(params)
+        bf_viol, cal_viol = _arbitrage_diagnostics(params, n_regimes)
 
-    model = _build_model(surface, params, q, weights, x_grid, t_grid, max_t)
+    model = _build_model(surface, params, q, weights, x_grid, t_grid, max_t, n_regimes)
     final_iv = _pde_implied_vol_nodes(model, nodes, num_x=num_x, steps_per_year=steps_per_year)
     errors = final_iv - market_iv
 

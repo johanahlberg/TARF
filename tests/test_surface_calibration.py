@@ -239,12 +239,23 @@ def test_calibrate_regime_model_full_pipeline():
     skew = lv[:, 0] - lv[:, 2]                                  # put minus call wing
     assert skew[0] < skew[1] < skew[2]                          # stressed regime is steeper-skew
 
+
+def test_n_regimes_1_is_a_single_dupire_model_and_faster_to_price():
+    surface = _skew_surface()
+    model, report = calibrate_regime_model(
+        surface, n_regimes=1, num_x=401, steps_per_year=300, dupire_nt=21, dupire_nx=101,
+    )
+    assert model.n_regimes == 1
+    assert report.rms_vol_error < 5e-4          # a single Dupire model reprices the surface tightly
+    assert report.level_spread == 0.0 and report.skew_spread == 0.0
+
     tarf = TARFAccumulator(
         target_level=0.10, strike=0.82, fixing_dates=tuple((k + 1) / 12 for k in range(12)),
         is_call_option=False, notional1=1.0, notional2=2.0, target_adjustment=0,
     )
-    price = ThreeRegimePricer(model, model.regime_weights, num_spot=121, num_target=60, n_steps=80).price_tarf(tarf, 1.0)
-    assert np.isfinite(price)
+    price = model.price_tarf(tarf, 1.0, num_spot=121, num_target=60, n_steps=80)
+    greeks = model.tarf_greeks(tarf, 1.0, num_spot=121, num_target=60, n_steps=80)
+    assert np.isfinite(price) and np.isfinite(greeks["vega"]) and np.isfinite(greeks["delta"])
 
 
 # --------------------------------------------------------------------------------------------------

@@ -55,19 +55,20 @@ class RegimeForwardPDE:
         steps_per_year: int = 400,
         min_sub_steps: int = 12,
     ) -> None:
-        if len(regime_local_vols) != 3:
-            raise ValueError("expected three regime local-vol functions")
         self.regime_local_vols = list(regime_local_vols)
+        self.n_regimes = len(self.regime_local_vols)
+        if self.n_regimes < 1:
+            raise ValueError("need at least one regime local-vol function")
         self.rate = float(domestic_rate)
         self.dividend_yield = float(foreign_rate)
 
         self.q_T = np.asarray(q, dtype=float).T
-        if self.q_T.shape != (3, 3):
-            raise ValueError("q must be 3x3")
+        if self.q_T.shape != (self.n_regimes, self.n_regimes):
+            raise ValueError(f"q must be {self.n_regimes}x{self.n_regimes}")
 
         self.weights = np.asarray(weights, dtype=float)
-        if self.weights.shape != (3,) or not np.isclose(self.weights.sum(), 1.0):
-            raise ValueError("weights must be a length-3 vector summing to 1")
+        if self.weights.shape != (self.n_regimes,) or not np.isclose(self.weights.sum(), 1.0):
+            raise ValueError(f"weights must be a length-{self.n_regimes} vector summing to 1")
 
         num_x = int(num_x) | 1  # force odd so the spot sits on the centre node
         half_width = max(n_std * sigma_ref * np.sqrt(max(max_t, 1e-6)), 0.2)
@@ -122,7 +123,7 @@ class RegimeForwardPDE:
         # Seed at a small t_eps with the analytic per-regime lognormal density (exact for flat vol
         # over one short step, and switching is still negligible), rather than a raw point mass.
         t_eps = min(checkpoints[0] / 20.0, 1.0 / 365.0)
-        p = np.empty((3, self.x.size))
+        p = np.empty((self.n_regimes, self.x.size))
         for i, local_vol in enumerate(self.regime_local_vols):
             sig = float(np.asarray(local_vol(np.array([self.log_spot]), 0.5 * t_eps))[0])
             mean = self.log_spot + (self.rate - self.dividend_yield - 0.5 * sig * sig) * t_eps

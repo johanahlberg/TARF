@@ -459,10 +459,11 @@ def calibrated_tarf_model_from_surface(
     maturity: float,
     surface: FXVolSurface,
     *,
+    n_regimes: int = 3,
     regime_weights: Sequence[float] = (0.25, 0.5, 0.25),
     q_matrix: Sequence[Sequence[float]] | None = None,
-    regime_level_spread: float = 0.04,
-    regime_skew_spread: float = 0.10,
+    regime_level_spread: float = 0.18,
+    regime_skew_spread: float = 0.15,
     is_call_option: bool = True,
     notional1: Sequence[float] | float = 1.0,
     notional2: Sequence[float] | float = 1.0,
@@ -476,14 +477,16 @@ def calibrated_tarf_model_from_surface(
     calibrate_q: bool = True,
     calibration_kwargs: dict | None = None,
 ) -> dict[str, object]:
-    """Calibrate the full three-regime model to ``surface`` (arbitrage-free SVI smile, analytic
-    Dupire local vol, forward regime-switching PDE, plus the switch rate) and price the TARF with it.
-    ``result`` holds the DenominatedValue; ``calibration`` the fit report.
+    """Calibrate the local-vol model to ``surface`` (arbitrage-free SVI smile, analytic Dupire local
+    vol) and price the TARF with it. ``n_regimes=1`` -- a single Dupire local-vol model
+    (``SingleRegimePricer``, ~3x faster, no forward-smile dynamics); ``n_regimes=3`` -- the coupled
+    regime-switching model. ``result`` holds the DenominatedValue; ``calibration`` the fit report.
     """
     weights = np.asarray(regime_weights, dtype=float)
     q = None if q_matrix is None else np.asarray(q_matrix, dtype=float)
     model, report = calibrate_regime_model(
-        surface, weights, q=q, level_spread=regime_level_spread, skew_spread=regime_skew_spread,
+        surface, weights, n_regimes=int(n_regimes), q=q,
+        level_spread=regime_level_spread, skew_spread=regime_skew_spread,
         calibrate_q=calibrate_q, **(calibration_kwargs or {})
     )
 
@@ -499,14 +502,13 @@ def calibrated_tarf_model_from_surface(
         inverted_target=bool(inverted_target),
         accumulated_value=float(accumulated_value),
     )
-    price = ThreeRegimePricer(
-        model, model.regime_weights, num_spot=num_spot, num_target=num_target, n_steps=n_steps
-    ).price_tarf(tarf, float(maturity))
+    price = model.price_tarf(tarf, float(maturity), num_spot=num_spot, num_target=num_target, n_steps=n_steps)
 
     unit = _denominated_unit(strike_value, "strike_value")
     return {
         "result": _make_denominated_value(price, unit, valuation_date),
         "calibration": {
+            "n_regimes": model.n_regimes,
             "rms_vol_error": report.rms_vol_error,
             "max_vol_error": report.max_vol_error,
             "svi_rms_vol_error": surface.svi_report.rms_vol_error if surface.svi_report else None,

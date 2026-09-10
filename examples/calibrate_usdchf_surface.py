@@ -1,19 +1,17 @@
-"""Calibrate the three-regime local-vol model to a full USDCHF vol surface, then price the
-seasoned seller TARF with the calibrated model.
+"""Calibrate the local-vol model to a full USDCHF vol surface, then price the seasoned seller TARF.
 
 Pipeline:
 
     broker quotes (ATM, 25d & 10d RR/BF; market strangles)   [sample_market_data]
-        -> FXVolSurface  (reconstruct the 5-point smile per tenor, term structure)
-        -> calibrate_regime_surface  (shared base smile + regime dispersion; Dupire local vol;
-                                      forward regime-switching PDE re-anchoring)
-        -> CalibratedRegimeModel  (3 time-dependent Dupire regimes + generator)
-        -> ThreeRegimePricer  ->  TARF price
+        -> FXVolSurface        (5-point smile per tenor -> arbitrage-free SVI slice)
+        -> calibrate_regime_model(n_regimes=3)   regimes differ in level AND skew; analytic Dupire;
+                                                 forward regime-switching PDE; then the switch rate
+        -> CalibratedRegimeModel.price_tarf      (dispatches to ThreeRegimePricer)
 
-Compares the calibrated price with the crude 3-point proxy (25dP / ATM / 25dC as flat regime vols)
-that ``front_arena.tarf_model_from_market_data`` uses.
+Then prices the same deal with ``n_regimes=1`` (a single Dupire local-vol model, ~3x faster) and the
+crude 3-point proxy that ``front_arena.tarf_model_from_market_data`` uses, to show the regime effect.
 
-Run:  python examples/calibrate_usdchf_surface.py   (~20-30 s: the calibration runs the forward PDE)
+Run:  python examples/calibrate_usdchf_surface.py   (~30 s: the calibration runs the forward PDE)
 """
 
 from __future__ import annotations
@@ -33,7 +31,6 @@ from tarf_rslv import (
     FXVolSurface,
     SmileQuotes,
     TARFAccumulator,
-    ThreeRegimePricer,
     build_default_regime_matrix,
     calibrate_regime_model,
     price_tarf,
@@ -111,17 +108,21 @@ def main() -> None:
         is_call_option=False, notional1=1.0, notional2=2.0, target_adjustment=0,
         accumulated_value=accumulated,
     )
-    calibrated_px = ThreeRegimePricer(
-        model, model.regime_weights, num_spot=161, num_target=120, n_steps=140
-    ).price_tarf(tarf, maturity)
+    px3 = model.price_tarf(tarf, maturity, num_spot=161, num_target=120, n_steps=140)
+
+    # the same deal on the single Dupire local-vol model (n_regimes=1) -- ~3x faster to price
+    t0 = time.time()
+    single, single_rep = calibrate_regime_model(surface, n_regimes=1)
+    px1 = single.price_tarf(tarf, maturity, num_spot=161, num_target=120, n_steps=140)
+    print(f"\n  Single Dupire model (n_regimes=1): calibrated in {time.time() - t0:.1f}s, "
+          f"surface RMS {single_rep.rms_vol_error * 1e4:.2f} bp")
 
     # crude 3-point proxy: 25dP / ATM / 25dC of the 6m smile as flat regime vols
     smile_6m = next(s for s in surface.smiles if abs(s.tenor - 0.5) < 1e-6)
-    strikes, vols = smile_6m.knots(SPOT, f6, surface.foreign_df(0.5), surface.domestic_df(0.5), surface.convention)
-    proxy_vols = [float(vols[1]), float(vols[2]), float(vols[3])]  # 25dP, ATM, 25dC
+    _, vols = smile_6m.knots(SPOT, f6, surface.foreign_df(0.5), surface.domestic_df(0.5), surface.convention)
     proxy_px = price_tarf(
         spot=SPOT, strike=STRIKE, target_level=TARGET, fixing_times=fixing_times, maturity=maturity,
-        domestic_rate=r_chf, foreign_rate=r_usd, regime_volatilities=proxy_vols,
+        domestic_rate=r_chf, foreign_rate=r_usd, regime_volatilities=[float(vols[1]), float(vols[2]), float(vols[3])],
         regime_weights=REGIME_WEIGHTS, q_matrix=build_default_regime_matrix().tolist(),
         is_call_option=False, notional1=1.0, notional2=2.0, target_adjustment=0,
         accumulated_value=accumulated, num_target=120,
@@ -129,9 +130,10 @@ def main() -> None:
 
     print("\n" + "-" * 74)
     print(f"  Seasoned USDCHF seller TARF  (T={maturity:.3f}y, accumulated {accumulated})")
-    print(f"    calibrated full-surface model   {calibrated_px:+.6f} CHF/USD  ({calibrated_px * 1e4:+.1f} pips)")
+    print(f"    3-regime calibrated model       {px3:+.6f} CHF/USD  ({px3 * 1e4:+.1f} pips)")
+    print(f"    single Dupire model             {px1:+.6f} CHF/USD  ({px1 * 1e4:+.1f} pips)   "
+          f"[regime effect {(px3 - px1) * 1e4:+.1f} pips]")
     print(f"    crude 3-point proxy             {proxy_px:+.6f} CHF/USD  ({proxy_px * 1e4:+.1f} pips)")
-    print(f"    difference                      {(calibrated_px - proxy_px) * 1e4:+.1f} pips")
     print("-" * 74)
 
 
